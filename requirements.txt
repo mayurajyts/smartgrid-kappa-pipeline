@@ -11,6 +11,13 @@
 pydantic~=2.9
 pydantic-settings~=2.6
 
+# Kafka client. confluent-kafka (librdkafka) rather than the pure-Python
+# kafka-python: it is the client matching the Confluent broker in use, and it
+# exposes the per-record delivery callbacks and record headers this design needs
+# for the correlation-id trace. Prebuilt wheels exist for CPython 3.11 on
+# Windows/macOS/Linux, so no compiler is needed on a marker's machine.
+confluent-kafka~=2.5
+
 # Observability (§8)
 structlog~=24.4
 prometheus-client~=0.21

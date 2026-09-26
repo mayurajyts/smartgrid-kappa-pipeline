@@ -25,7 +25,8 @@ SHELL := /bin/bash
 # working regardless of how Compose is installed on the marker's machine.
 COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 
-.PHONY: help env anchor up down ps logs topics psql s3 test clock clean
+.PHONY: help env anchor up down ps logs topics psql s3 test clock clean \
+        consume compaction drop faults
 
 help:  ## Show available targets
 	@echo "Smart Grid Kappa Pipeline"
@@ -102,6 +103,127 @@ s3:  ## Show the object store endpoints and the curated bucket
 		&& echo "" \
 		&& echo "Buckets:" \
 		&& curl -s "http://localhost:$$S3_API_HOST_PORT/" ; echo
+
+
+# ---------------------------------------------------------------------------
+# PHASE 1 CHECKPOINT targets
+# ---------------------------------------------------------------------------
+
+consume:  ## PHASE 1 CHECKPOINT: show well-formed events on all three topics
+	@source .env && echo "==================================================================" \
+		&& echo "1/3  $$TOPIC_METER_READINGS  (telemetry, keyed by grid_zone)" \
+		&& echo "==================================================================" \
+		&& $(COMPOSE) exec kafka kafka-console-consumer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_METER_READINGS \
+			--property print.key=true --property key.separator=' | ' \
+			--max-messages 5 --timeout-ms 20000 || true
+	@source .env && echo "" \
+		&& echo "==================================================================" \
+		&& echo "2/3  $$TOPIC_TARIFF_REFERENCE  (compacted, keyed by household_id)" \
+		&& echo "     Empty until the first simulated day boundary (~5 real min):" \
+		&& echo "     day D tariff is delivered at the start of day D+1 per S14." \
+		&& echo "==================================================================" \
+		&& $(COMPOSE) exec kafka kafka-console-consumer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_TARIFF_REFERENCE --from-beginning \
+			--property print.key=true --property key.separator=' | ' \
+			--max-messages 3 --timeout-ms 15000 || true
+	@source .env && echo "" \
+		&& echo "==================================================================" \
+		&& echo "3/3  $$TOPIC_WEATHER_FORECAST  (compacted, keyed grid_zone|sim_date)" \
+		&& echo "==================================================================" \
+		&& $(COMPOSE) exec kafka kafka-console-consumer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_WEATHER_FORECAST --from-beginning \
+			--property print.key=true --property key.separator=' | ' \
+			--max-messages 3 --timeout-ms 15000 || true
+
+# The second half of the Phase 1 checkpoint, and the mechanism the entire Kappa
+# argument rests on: a corrected tariff is a NEW record under the same key, never
+# a mutation. Log compaction then retains only the latest value per household,
+# which is what makes the topic usable as a broadcast dimension in Job C and what
+# makes bill restatement (R7) possible without a second processing engine.
+#
+# WHY THIS TARGET FORCES A SEGMENT ROLL:
+# Kafka's log cleaner only compacts CLOSED segments - it never touches the active
+# one. With segment.ms=60000 a segment closes when a write arrives more than 60s
+# after the segment was created. So simply publishing a corrected record and
+# waiting shows BOTH versions indefinitely, which looks like compaction is broken
+# when it is working exactly as designed. This target therefore publishes the
+# correction, waits past segment.ms, writes one more record to trigger the roll,
+# and only then reads back - so the collapse is actually observable.
+compaction:  ## PHASE 1 CHECKPOINT: prove the tariff topic compacts by key
+	@source .env \
+		&& echo "==================================================================" \
+		&& echo "STEP 1  Publish a CORRECTED tariff for HH-0001 under the SAME key" \
+		&& echo "        (this is what an R7 restatement looks like: an append," \
+		&& echo "         never an update)" \
+		&& echo "==================================================================" \
+		&& printf 'HH-0001|{"household_id":"HH-0001","sim_date":"2026-01-01","tariff_rate":99.99,"billing_tier":"TIER_4","subsidy_flag":false,"effective_from":"2026-01-01T00:00:00Z","schema_version":1}\n' \
+		| $(COMPOSE) exec --no-TTY kafka kafka-console-producer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_TARIFF_REFERENCE \
+			--property parse.key=true --property key.separator='|' \
+		&& echo "" \
+		&& echo "Both versions are now in the log (the original and the correction):" \
+		&& $(COMPOSE) exec kafka kafka-console-consumer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_TARIFF_REFERENCE --from-beginning \
+			--property print.key=true --property key.separator=' | ' \
+			--timeout-ms 15000 2>/dev/null | grep '^HH-0001' || true
+	@source .env \
+		&& echo "" \
+		&& echo "==================================================================" \
+		&& echo "STEP 2  Force the active segment to close so the cleaner can run" \
+		&& echo "        (Kafka never compacts the ACTIVE segment; segment.ms=60s," \
+		&& echo "         so we wait past it and then write once more)" \
+		&& echo "==================================================================" \
+		&& sleep 70 \
+		&& printf 'HH-9999|{"household_id":"HH-9999","sim_date":"2026-01-01","tariff_rate":1.0,"billing_tier":"TIER_1","subsidy_flag":false,"effective_from":"2026-01-01T00:00:00Z","schema_version":1}\n' \
+		| $(COMPOSE) exec --no-TTY kafka kafka-console-producer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_TARIFF_REFERENCE \
+			--property parse.key=true --property key.separator='|' \
+		&& echo "Waiting for the log cleaner..." \
+		&& sleep 45
+	@source .env \
+		&& echo "" \
+		&& echo "==================================================================" \
+		&& echo "STEP 3  Read back: ONE surviving record per household_id." \
+		&& echo "        The superseded tariff is gone; the correction remains." \
+		&& echo "==================================================================" \
+		&& $(COMPOSE) exec kafka kafka-console-consumer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_TARIFF_REFERENCE --from-beginning \
+			--property print.key=true --property key.separator=' | ' \
+			--timeout-ms 20000 2>/dev/null | grep '^HH-0001' || true
+	@echo ""
+	@echo "Log cleaner activity (proof the broker compacted, not just that we read):"
+	@$(COMPOSE) logs kafka 2>/dev/null | grep -i "cleaned log" | tail -3 || true
+	@echo ""
+	@echo "Topic configuration (cleanup.policy=compact is what makes this work):"
+	@source .env && $(COMPOSE) exec kafka kafka-configs \
+		--bootstrap-server localhost:9092 --describe \
+		--entity-type topics --entity-name $$TOPIC_TARIFF_REFERENCE \
+		| grep -o "cleanup.policy=compact" | head -1
+
+drop:  ## List the daily-feed drop directory and processed markers
+	@echo "Drop directory (tariff CSV + weather JSON, one pair per simulated day):"
+	@$(COMPOSE) exec batch-loader ls -la /data/drop || true
+	@echo ""
+	@echo "Processed markers (written only after a successful Kafka flush):"
+	@$(COMPOSE) exec batch-loader ls -la /data/drop/.processed || true
+
+faults:  ## Show the deliberately injected faults (Phase 2 DLQ fixtures)
+	@echo "Injected faults so far - each carries the correlation_id that will"
+	@echo "appear on the matching DLQ record once Job A is running (Phase 2):"
+	@$(COMPOSE) logs meter-simulator 2>/dev/null \
+		| grep fault_injected | tail -20 || echo "  (none yet)"
+	@echo ""
+	@echo "Counts by fault type:"
+	@$(COMPOSE) logs meter-simulator 2>/dev/null \
+		| grep -o '"fault": "[a-z_]*"' | sort | uniq -c | sort -rn || true
 
 test:  ## Run the unit test suite
 	python -m pytest tests/unit -v

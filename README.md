@@ -92,6 +92,9 @@ make ps       # container status
 make topics   # topic inventory and configuration
 make logs     # tail everything (make logs S=kafka for one service)
 make s3       # object store endpoints and buckets
+make consume  # show events on all three topics
+make faults   # show the deliberately injected faults
+make drop     # list the daily-feed drop directory
 make test     # run the unit tests
 make down     # stop, keeping all data
 make clean    # stop and DESTROY all data (prompts first)
@@ -99,7 +102,7 @@ make clean    # stop and DESTROY all data (prompts first)
 
 ---
 
-## Current status: Phase 0 (Scaffold) complete
+## Current status: Phase 1 (Simulators) complete
 
 The build follows the eight phases in
 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) §10.
@@ -107,7 +110,7 @@ The build follows the eight phases in
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Scaffold: Compose infra, `common/`, Makefile | ✅ complete |
-| 1 | Simulators + batch loader | pending |
+| 1 | Simulators + batch loader | ✅ complete |
 | 2 | Job A — clean, validate, dedupe, enrich, DLQ | pending |
 | 3 | Jobs B & C — zone aggregates, household billing | pending |
 | 4 | Serving: Postgres schema, FastAPI, Grafana | pending |
@@ -115,6 +118,97 @@ The build follows the eight phases in
 | 6 | Observability: metrics, alert rules, tracing | pending |
 | 7 | Hardening: tests, `make demo` | pending |
 | 8 | Report & demo | pending |
+
+
+### Verifying the Phase 1 checkpoint
+
+> *"`kafka-console-consumer` shows well-formed events on all three topics; tariff
+> topic compacts correctly."*
+
+**1. All three topics carry well-formed events.**
+
+```bash
+make consume
+```
+
+`meter.readings.v1` fills immediately, keyed by `grid_zone`. The two reference
+topics stay **empty for the first ~5 real minutes** — that is correct, not a
+failure: §14 specifies that day *D*'s tariff is delivered at the start of day
+*D+1*, so the first simulated day genuinely has no tariff. This is what exercises
+Job C's explicit choice to write the running kWh with `tariff_rate = NULL` rather
+than invent a rate.
+
+**2. The tariff topic compacts by key.** This is the mechanism the whole Kappa
+argument rests on, so it gets its own target:
+
+```bash
+make compaction    # takes ~2 min: it must force a segment roll
+```
+
+It publishes a *corrected* tariff for one household under the same key, then shows
+only the corrected value surviving. A restatement is an **append, never an
+update** — which is exactly how R7 is satisfied without a second processing
+engine.
+
+The target deliberately forces a segment roll, because Kafka's log cleaner never
+compacts the **active** segment. Publishing a correction and simply waiting shows
+both versions indefinitely and looks like compaction is broken when it is working
+as designed.
+
+**3. Deliberate faults are being injected** — these are the fixtures Phase 2's DLQ
+and Phase 3's deduplication are built to catch:
+
+```bash
+make faults
+```
+
+| Fault | Rate | What it exercises |
+|---|---|---|
+| `null_required_field` | 0.2% | Job A DLQ → `null_required_field` |
+| `negative_kwh` | 0.2% | Job A DLQ → `negative_kwh` |
+| `solar_above_capacity` | 0.2% | Job A DLQ → `solar_above_capacity` |
+| `timestamp_in_future` | 0.2% | Job A DLQ → `timestamp_in_future` |
+| `duplicate` | 1.0% | `dropDuplicates(["event_id"])` |
+| `late_event` | 1.0% | the 2-minute watermark (back-dated 4 sim min) |
+| `meter_dropout` | 0.1% | `METER_SILENT` alert, `NoDataReceived` rule |
+
+The four rejection faults sum to **0.8%**, deliberately below the 2% data-quality
+gate the Airflow DAG enforces (§7) — larger values would make the pipeline fail its
+own gate by design. Every injected fault logs its `correlation_id`, so a DLQ record
+found in Phase 2 can be traced back to the exact moment it was created. That is the
+§11 step 7 trace demo.
+
+**4. The daily file feed lands and is loaded.**
+
+```bash
+make drop
+```
+
+Expect a `tariff_<sim_date>.csv` / `weather_<sim_date>.json` pair per completed
+simulated day, plus a `.processed` marker per loaded file. Files are written to a
+temp name and atomically renamed, so the polling loader can never read a
+half-written file.
+
+**5. Per-zone ordering holds.** Kafka orders only *within* a partition, so the
+1-minute tumbling zone aggregates depend on each zone's records staying on one
+partition:
+
+```bash
+source .env && docker compose exec kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 --topic $TOPIC_METER_READINGS \
+  --partition 0 --from-beginning --max-messages 20 \
+  --property print.key=true --property print.value=false
+```
+
+Every key on a given partition is the same zone. Note that with 5 zone keys across
+6 partitions, some partitions are empty and two zones may share one — both are
+correct: the guarantee needed is per-zone ordering, not one-zone-per-partition.
+
+**6. Unit tests pass.**
+
+```bash
+make test
+```
 
 ### Verifying the Phase 0 checkpoint
 
@@ -188,6 +282,26 @@ make clean && make up
 The stack must reach the same state from empty volumes.
 
 ---
+
+
+## The simulated world
+
+Committed in `simulators/reference/`, **not generated at startup**:
+
+- **200 households** across **5 grid zones**, **60% with solar** (§14).
+- Zone sizes are deliberately uneven, so zone aggregates differ visibly rather
+  than all tracking the same line.
+- Tariff tier correlates with a household's base load, so the billing report's
+  consumer ranking is coherent.
+
+The population is fixed rather than random because the headline demo (§11 step 8)
+replays a simulated day and shows the bill recomputing to the same value. With a
+randomly generated population, a replay would run against different households and
+"the bill came out the same" would be meaningless.
+
+Consumption and solar generation are **deterministic functions of (meter,
+simulated instant)** — seeded per reading rather than drawn from a global RNG — for
+the same reason.
 
 ## Repository layout
 

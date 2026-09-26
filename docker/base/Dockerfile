@@ -34,8 +34,24 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY common/ /app/common/
 
 # Run as a non-root user. Nothing here needs root, and it keeps files written to
-# bind-mounted volumes from landing on the host owned by root.
+# mounted volumes from landing on the host owned by root.
 RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
+
+# Pre-create the drop directory and hand it to appuser BEFORE the volume is
+# mounted over it.
+#
+# Docker creates a named volume's mountpoint as root:root mode 755. A container
+# running as a non-root user therefore cannot write into a freshly created volume
+# — the tariff simulator could not drop its files and the batch loader could not
+# create its marker directory. When a named volume is mounted onto a path that
+# ALREADY exists in the image, Docker seeds the volume from that path, including
+# its ownership, so creating it here with the right owner fixes both services.
+#
+# The alternative — running these containers as root — would work but would mean
+# every file the daily feed writes is root-owned, which is the thing the non-root
+# user is here to avoid.
+RUN mkdir -p /data/drop && chown -R appuser:appuser /data
+
 USER appuser
 
 CMD ["python", "-c", "from common.sim_clock import startup_banner; print(startup_banner())"]

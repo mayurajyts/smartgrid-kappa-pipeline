@@ -183,14 +183,25 @@ def stage_boundary(
     if stage not in VALID_STAGES:
         raise ValueError(f"stage must be one of {sorted(VALID_STAGES)}, got {stage!r}")
 
+    # Surfaced explicitly so "is this stage losing records?" is answerable from a
+    # single log line without arithmetic.
+    #
+    # Clamped at zero because a stage may legitimately emit MORE than it consumed:
+    # the meter simulator publishes injected duplicates, so out > in by design. An
+    # unclamped subtraction reported "records_dropped: -3", which reads as a
+    # correctness problem rather than as intentional duplication. The surplus is
+    # reported separately instead, so neither case is hidden.
+    balance = records_in - records_out - records_rejected
+
     logger.info(
         "stage_boundary",
         stage=stage,
         records_in=records_in,
         records_out=records_out,
         records_rejected=records_rejected,
-        # Surfaced explicitly so the "is anything being dropped" question is
-        # answerable from a single log line without arithmetic.
-        records_dropped=records_in - records_out - records_rejected,
+        records_dropped=max(balance, 0),
+        # Only present when a stage amplified its input, which is always
+        # deliberate (duplicate injection, or a fan-out transform).
+        records_amplified=(-balance if balance < 0 else None),
         **extra,
     )

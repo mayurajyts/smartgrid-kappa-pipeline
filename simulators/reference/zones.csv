@@ -1,0 +1,6 @@
+grid_zone,name,capacity_kw,latitude_deg
+ZONE-A,Matara Central,1200.0,5.95
+ZONE-B,Matara Coastal,900.0,5.92
+ZONE-C,Hakmana Rural,650.0,6.1
+ZONE-D,Akuressa Industrial,1500.0,6.15
+ZONE-E,Dikwella Suburban,800.0,5.88

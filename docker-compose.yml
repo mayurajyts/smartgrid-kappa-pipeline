@@ -234,6 +234,151 @@ services:
     entrypoint: ["/bin/sh", "/opt/create_buckets.sh"]
     restart: "no"
 
+
+  # ===========================================================================
+  # PHASE 1 - data sources
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Shared Python base image. Built once as a dependency of the three services
+  # below so they provably run the same `common/` code - the single definition of
+  # the config, the contracts, the log shape and the simulated clock.
+  #
+  # This is an image-only service: it runs a trivial command, exits 0, and the
+  # others depend on it with `condition: service_completed_successfully` so the
+  # image exists before they build on it.
+  # ---------------------------------------------------------------------------
+  base-image:
+    build:
+      context: .
+      dockerfile: docker/base/Dockerfile
+    image: smartgrid-base:latest
+    container_name: smartgrid-base-image
+    command: ["python", "-c", "print('base image built')"]
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Meter telemetry - the streaming source (section 4.1).
+  #
+  # ~200 meters emitting every 2 real seconds, keyed by grid_zone for per-zone
+  # ordering. Injects the duplicates, late events, nulls, negative kWh and meter
+  # dropout that Job A validation and the DLQ are built to catch.
+  # ---------------------------------------------------------------------------
+  meter-simulator:
+    build:
+      context: .
+      dockerfile: docker/simulators/Dockerfile
+    image: smartgrid-meter-simulator:latest
+    container_name: smartgrid-meter-simulator
+    depends_on:
+      base-image:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      # Gated on topic creation COMPLETING, not merely on the broker being up.
+      # Auto-creation is disabled on the broker, so a producer starting first
+      # would fail every publish with UNKNOWN_TOPIC_OR_PART.
+      kafka-init:
+        condition: service_completed_successfully
+    command: ["python", "-m", "simulators.meter_simulator"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      TOPIC_METER_READINGS: ${TOPIC_METER_READINGS}
+      SIM_START_DATE: ${SIM_START_DATE}
+      SIM_ANCHOR_REAL: ${SIM_ANCHOR_REAL}
+      SIM_DAY_REAL_SECONDS: ${SIM_DAY_REAL_SECONDS}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT}
+      METRICS_PORT: ${METRICS_PORT}
+      METER_TICK_REAL_SECONDS: ${METER_TICK_REAL_SECONDS}
+      METER_LIMIT: ${METER_LIMIT}
+      DEFAULT_SOLAR_INDEX: ${DEFAULT_SOLAR_INDEX}
+      FAULT_INJECTION_ENABLED: ${FAULT_INJECTION_ENABLED}
+      FAULT_RATE_NULL_FIELD: ${FAULT_RATE_NULL_FIELD}
+      FAULT_RATE_NEGATIVE_KWH: ${FAULT_RATE_NEGATIVE_KWH}
+      FAULT_RATE_SOLAR_SPIKE: ${FAULT_RATE_SOLAR_SPIKE}
+      FAULT_RATE_FUTURE_TIMESTAMP: ${FAULT_RATE_FUTURE_TIMESTAMP}
+      FAULT_RATE_DUPLICATE: ${FAULT_RATE_DUPLICATE}
+      FAULT_RATE_LATE_EVENT: ${FAULT_RATE_LATE_EVENT}
+      FAULT_LATE_EVENT_SIM_MINUTES: ${FAULT_LATE_EVENT_SIM_MINUTES}
+      FAULT_FUTURE_TIMESTAMP_SIM_MINUTES: ${FAULT_FUTURE_TIMESTAMP_SIM_MINUTES}
+      FAULT_RATE_METER_DROPOUT: ${FAULT_RATE_METER_DROPOUT}
+      FAULT_METER_DROPOUT_REAL_SECONDS: ${FAULT_METER_DROPOUT_REAL_SECONDS}
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Daily tariff + weather feed - the batch-shaped source (sections 4.1, 14).
+  #
+  # Writes files to the drop volume at each simulated day boundary, modelling a
+  # real end-of-day utility feed. Day D tariff arrives when day D+1 begins, so
+  # the first simulated day deliberately has no tariff - which is what exercises
+  # the Job C "write running kWh with tariff_rate = NULL rather than guess" path.
+  # ---------------------------------------------------------------------------
+  tariff-simulator:
+    build:
+      context: .
+      dockerfile: docker/simulators/Dockerfile
+    image: smartgrid-meter-simulator:latest
+    container_name: smartgrid-tariff-simulator
+    depends_on:
+      base-image:
+        condition: service_completed_successfully
+    command: ["python", "-m", "simulators.tariff_simulator"]
+    environment:
+      SIM_START_DATE: ${SIM_START_DATE}
+      SIM_ANCHOR_REAL: ${SIM_ANCHOR_REAL}
+      SIM_DAY_REAL_SECONDS: ${SIM_DAY_REAL_SECONDS}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT}
+      METRICS_PORT: ${METRICS_PORT}
+      DROP_DIR: ${DROP_DIR}
+      SUBSIDY_SHARE: ${SUBSIDY_SHARE}
+      OVERCAST_DAY_PROBABILITY: ${OVERCAST_DAY_PROBABILITY}
+      SEED_PREVIOUS_DAY_ON_STARTUP: ${SEED_PREVIOUS_DAY_ON_STARTUP}
+    volumes:
+      - drop-data:/data/drop
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Batch loader - the file feed bridge into the log (section 4.1).
+  #
+  # This is what keeps the architecture Kappa rather than Lambda: the daily file
+  # feed becomes keyed records on compacted topics, so the processing layer has
+  # exactly one kind of input.
+  # ---------------------------------------------------------------------------
+  batch-loader:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    image: smartgrid-batch-loader:latest
+    container_name: smartgrid-batch-loader
+    depends_on:
+      base-image:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    command: ["python", "-m", "ingestion.batch_loader"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      TOPIC_TARIFF_REFERENCE: ${TOPIC_TARIFF_REFERENCE}
+      TOPIC_WEATHER_FORECAST: ${TOPIC_WEATHER_FORECAST}
+      SIM_START_DATE: ${SIM_START_DATE}
+      SIM_ANCHOR_REAL: ${SIM_ANCHOR_REAL}
+      SIM_DAY_REAL_SECONDS: ${SIM_DAY_REAL_SECONDS}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT}
+      METRICS_PORT: ${METRICS_PORT}
+      DROP_DIR: ${DROP_DIR}
+      PROCESSED_MARKER_DIR: ${PROCESSED_MARKER_DIR}
+      LOADER_POLL_SECONDS: ${LOADER_POLL_SECONDS}
+    volumes:
+      # Read-write: the loader writes its processed-file markers under the drop
+      # directory, in a dotted subdirectory so they are never mistaken for input.
+      - drop-data:/data/drop
+    restart: unless-stopped
+
 # -----------------------------------------------------------------------------
 # Named volumes, not bind mounts, for service state. Named volumes are managed
 # by Docker and behave identically on Windows, macOS and Linux — bind-mounting a
@@ -245,3 +390,8 @@ volumes:
   kafka-data:
   postgres-data:
   objectstore-data:
+  # The drop directory, shared between the tariff simulator (writer) and the
+  # batch loader (reader). A named volume rather than a host bind mount: bind
+  # mounts on Docker Desktop for Windows have inconsistent write-visibility
+  # semantics between containers, which a file handoff cannot tolerate.
+  drop-data:
