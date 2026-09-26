@@ -1,0 +1,21 @@
+# Local environment — .env.example is committed, .env is not
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+
+# Runtime data — all regenerable, never committed (reproducible-from-clean-clone rule)
+data/
+drop/
+checkpoints/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

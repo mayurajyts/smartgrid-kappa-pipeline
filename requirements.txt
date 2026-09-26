@@ -1,0 +1,19 @@
+# Shared Python dependencies for the non-Spark services (simulators, batch
+# loader, API). Pinned to minor versions so a clean clone six months from now
+# resolves to the same behaviour — a reproducibility requirement, not fussiness.
+#
+# PySpark is deliberately ABSENT. The Spark jobs run inside the Spark cluster
+# image, whose PySpark version must match the cluster exactly; installing a
+# second copy here would invite a driver/worker version mismatch, which
+# surfaces as an opaque serialisation error at runtime.
+
+# Config — typed, validated, environment-driven settings (common/config.py)
+pydantic~=2.9
+pydantic-settings~=2.6
+
+# Observability (§8)
+structlog~=24.4
+prometheus-client~=0.21
+
+# Tests
+pytest~=8.3

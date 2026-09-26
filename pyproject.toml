@@ -1,0 +1,18 @@
+# Project metadata and test configuration.
+#
+# The package layout is flat (`common/`, `processing/`, `serving/` at the repo
+# root) and mirrors plan §5 exactly, so the directory a marker reads in the
+# report is the directory they find in the repo.
+
+[project]
+name = "smartgrid-kappa-pipeline"
+version = "0.1.0"
+description = "EC8202 — Kappa architecture platform for smart grid monitoring and billing"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importmode=importlib with the repo root on the path lets tests import
+# `common.*` without an editable install, so `make test` works on a clean clone.
+addopts = "--import-mode=importlib"
+pythonpath = ["."]
