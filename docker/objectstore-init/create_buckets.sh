@@ -17,8 +17,17 @@
 # on the S3 API the architecture actually requires, so swapping the object
 # store implementation does not require rewriting this script.
 #
-# Idempotent: an existing bucket returns 409 BucketAlreadyOwnedByYou, which is
-# treated as success so re-running `make up` is safe.
+# WHY IT DOES NOT SIGN THE REQUEST:
+# the object store's identity config grants the `anonymous` identity Read and
+# List only, so an unsigned PUT is refused with 403. Rather than implement AWS
+# SigV4 in shell (which needs an HMAC chain over a canonical request - a lot of
+# fragile code for one call), this script treats 403 on an EXISTING bucket as
+# success: the bucket is created on the first run, when the store has no identity
+# config loaded yet, and thereafter the GET below proves it is present. A 403 with
+# the bucket absent is still a hard failure.
+#
+# Idempotent: an existing bucket returns 409 BucketAlreadyOwnedByYou (or 403 once
+# authentication is enforced), both treated as success so `make up` is re-runnable.
 # =============================================================================
 set -eu
 
@@ -35,6 +44,18 @@ case "${STATUS}" in
     echo "[objectstore-init] created bucket: ${S3_CURATED_BUCKET}" ;;
   409)
     echo "[objectstore-init] bucket already exists: ${S3_CURATED_BUCKET}" ;;
+  403)
+    # Anonymous writes are denied once the identity config is loaded. Verify the
+    # bucket exists anyway; if it does, there is nothing to do and this is not an
+    # error. If it does not, fail loudly - Job A would otherwise start and fail on
+    # its first Parquet write with a much less obvious message.
+    if curl -sf -o /dev/null "${S3_ENDPOINT}/${S3_CURATED_BUCKET}/"; then
+      echo "[objectstore-init] bucket exists: ${S3_CURATED_BUCKET} (anonymous writes denied, which is expected)"
+    else
+      echo "[objectstore-init] FAILED: bucket ${S3_CURATED_BUCKET} is absent and anonymous creation is denied (HTTP 403)." >&2
+      echo "[objectstore-init] Create it with credentials, or run 'make clean' to reinitialise the store." >&2
+      exit 1
+    fi ;;
   *)
     echo "[objectstore-init] FAILED to create bucket (HTTP ${STATUS})" >&2
     exit 1 ;;

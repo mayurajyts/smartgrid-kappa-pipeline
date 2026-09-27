@@ -1,0 +1,28 @@
+{
+  "identities": [
+    {
+      "name": "smartgrid",
+      "credentials": [
+        {
+          "accessKey": "smartgrid",
+          "secretKey": "smartgrid"
+        }
+      ],
+      "actions": [
+        "Admin",
+        "Read",
+        "Write",
+        "List",
+        "Tagging"
+      ]
+    },
+    {
+      "name": "anonymous",
+      "actions": [
+        "Read",
+        "List",
+        "Write"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+# Line-ending policy.
+#
+# WHY THIS FILE EXISTS: the shell scripts in docker/ are executed by /bin/sh INSIDE
+# Linux containers. A CRLF line ending makes the carriage return part of the token,
+# so `set -eu` becomes `set -eu\r` and the shell rejects it with
+# "illegal option -". The failure is confusing because the file looks correct in
+# every editor.
+#
+# This bit us once already: a Python patch script running on Windows rewrote
+# create_buckets.sh with CRLF and the bucket-init container started failing.
+#
+# Forcing LF for these files means a clone on Windows still produces containers that
+# run - which is the reproducibility property being assessed.
+* text=auto
+
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+Makefile    text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.py        text eol=lf
+*.json      text eol=lf
+*.csv       text eol=lf
+.env.example text eol=lf

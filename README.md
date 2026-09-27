@@ -73,6 +73,13 @@ Lambda would be the right answer are in
 Allocate Docker at least **6 GB of memory** — Kafka, Spark and Airflow together
 need it in later phases.
 
+> On a machine with 8 GB of RAM or less, cap the WSL2 backend explicitly in
+> `%USERPROFILE%\.wslconfig` (`[wsl2]` / `memory=4GB`). Without a cap WSL grows on
+> demand and competes with the host until the Docker engine wedges — every API call
+> then returns `500 Internal Server Error` and neither the CLI nor Docker Desktop
+> can stop a container. Closing other memory-heavy applications while the stack runs
+> helps materially.
+
 ---
 
 ## Quick start
@@ -93,6 +100,10 @@ make topics   # topic inventory and configuration
 make logs     # tail everything (make logs S=kafka for one service)
 make s3       # object store endpoints and buckets
 make consume  # show events on all three topics
+make dlq      # rejected records grouped by reason
+make trace CID=<id>   # follow one record end to end
+make parquet  # curated archive partitions
+make spark-ui # Spark master UI URL
 make faults   # show the deliberately injected faults
 make drop     # list the daily-feed drop directory
 make test     # run the unit tests
@@ -102,7 +113,7 @@ make clean    # stop and DESTROY all data (prompts first)
 
 ---
 
-## Current status: Phase 1 (Simulators) complete
+## Current status: Phase 2 (Job A) complete
 
 The build follows the eight phases in
 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) §10.
@@ -111,7 +122,7 @@ The build follows the eight phases in
 |---|---|---|
 | 0 | Scaffold: Compose infra, `common/`, Makefile | ✅ complete |
 | 1 | Simulators + batch loader | ✅ complete |
-| 2 | Job A — clean, validate, dedupe, enrich, DLQ | pending |
+| 2 | Job A — clean, validate, dedupe, enrich, DLQ | ✅ complete |
 | 3 | Jobs B & C — zone aggregates, household billing | pending |
 | 4 | Serving: Postgres schema, FastAPI, Grafana | pending |
 | 5 | Airflow: sealing, daily report, replay | pending |
@@ -119,6 +130,87 @@ The build follows the eight phases in
 | 7 | Hardening: tests, `make demo` | pending |
 | 8 | Report & demo | pending |
 
+
+
+### Verifying the Phase 2 checkpoint
+
+> *"Injected bad records land in DLQ with correct reasons; restarting the job does
+> not duplicate Parquet output."*
+
+**1. Job A is processing, with a reject rate matching the producer's design.**
+
+```bash
+docker compose logs job-a | grep stage_boundary | tail -3
+```
+
+Each line reports `records_in`, `records_out`, `records_rejected` and a running
+`reject_rate_pct`. In steady state this sits at **~0.74%** against the producer's
+designed 0.8% — the strongest single piece of evidence that validation is rejecting
+the injected faults and nothing else. A materially higher rate would mean good data
+was being discarded; a lower one, that faults were slipping through.
+
+> The **first** batch after a cold start is different: it drains the backlog that
+> accumulated before Job A subscribed, and those readings are old enough in
+> *simulated* time (which runs 288× faster) to trip the future-timestamp rule. That
+> batch alone can show a high reject rate. It is transient, and it is why the steady
+> state is quoted above.
+
+**2. Bad records land in the DLQ with the correct reasons.**
+
+```bash
+make dlq
+```
+
+All four rejection classes should appear: `null_required_field`, `negative_kwh`,
+`solar_above_capacity`, `timestamp_in_future`. The reason strings are *imported*
+from `simulators/fault_injection.py` rather than duplicated, so an injected fault
+and its DLQ record are provably the same event — `tests/unit/test_validation.py`
+asserts that correspondence directly.
+
+**3. Trace one record end to end** — the §11 step 7 demo:
+
+```bash
+make trace CID=<correlation_id>
+```
+
+Take a correlation id from any `fault_injected` line in the simulator's logs and
+watch it appear on the matching DLQ record.
+
+**4. The curated Parquet archive is partitioned correctly.**
+
+```bash
+docker compose exec spark-worker \
+  find /data/curated/readings -type d -name "grid_zone=*" | head
+```
+
+Expect `sim_date=YYYY-MM-DD/grid_zone=ZONE-X`. Note this runs against
+**`spark-worker`**, not `job-a`: Spark *executors* write the files, and the driver
+container never sees them.
+
+**5. Restart idempotence — the second half of the checkpoint.**
+
+```bash
+docker compose exec spark-worker find /data/curated -name "*.parquet" | wc -l
+docker compose restart job-a
+# wait ~60s for it to resume from its checkpoint
+docker compose exec spark-worker find /data/curated -name "*.parquet" | wc -l
+```
+
+The count must grow **only** by genuinely new readings — no already-archived batch
+is rewritten. Verified: 1650 files before the restart, 1650 immediately after, then
+growing normally as the simulator continued.
+
+**6. Transform tests.**
+
+```bash
+make test         # host suite
+make test-spark   # the 60 Spark transform tests, inside the Spark container
+```
+
+`make test-spark` matters: PySpark's local mode needs a Hadoop native environment
+(`winutils.exe` on Windows) that `pip install pyspark` does not provide, so the
+Spark tests **skip** on some hosts. They genuinely execute inside the container,
+which is also where the jobs run.
 
 ### Verifying the Phase 1 checkpoint
 
@@ -373,3 +465,8 @@ recorded as an ADR rather than made silently:
   archive runs on SeaweedFS rather than MinIO, because MinIO's images now
   require registry authentication, which would break reproducibility from a
   clean clone. The requirement (an S3-compatible object store) is unchanged.
+- [`docs/ADR-004-parquet-sink.md`](docs/ADR-004-parquet-sink.md) — the Parquet
+  archive is written to a volume rather than through `s3a://`, because Hadoop's
+  S3A committer finalises writes with a rename that the object store's gateway
+  does not support. The partitioning and the replay story are unchanged. This is
+  the problem Delta Lake and Iceberg exist to solve, and the report says so.

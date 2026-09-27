@@ -16,6 +16,14 @@ drop/
 checkpoints/
 *.log
 
+# Docker buildx state, created in-tree when DOCKER_CONFIG points here. Build
+# metadata, not source.
+.docker/
+
+# Scratch directories used while probing behaviour during development.
+probe_tmp/
+.probe/
+
 # OS
 .DS_Store
 Thumbs.db

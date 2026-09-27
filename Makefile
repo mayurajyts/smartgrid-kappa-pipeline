@@ -26,7 +26,7 @@ SHELL := /bin/bash
 COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 
 .PHONY: help env anchor up down ps logs topics psql s3 test clock clean \
-        consume compaction drop faults
+        consume compaction drop faults dlq trace parquet spark-ui test-spark
 
 help:  ## Show available targets
 	@echo "Smart Grid Kappa Pipeline"
@@ -224,6 +224,88 @@ faults:  ## Show the deliberately injected faults (Phase 2 DLQ fixtures)
 	@echo "Counts by fault type:"
 	@$(COMPOSE) logs meter-simulator 2>/dev/null \
 		| grep -o '"fault": "[a-z_]*"' | sort | uniq -c | sort -rn || true
+
+
+# ---------------------------------------------------------------------------
+# PHASE 2 CHECKPOINT targets
+# ---------------------------------------------------------------------------
+
+# The first half of the Phase 2 checkpoint. Shows not just THAT records were
+# rejected but WITH WHICH REASON - a DLQ full of records carrying the wrong reasons
+# would pass a naive count check while making the trace demo meaningless.
+dlq:  ## PHASE 2 CHECKPOINT: show DLQ records grouped by rejection reason
+	@source .env \
+		&& echo "==================================================================" \
+		&& echo "DEAD-LETTER QUEUE: $$TOPIC_METER_READINGS_DLQ" \
+		&& echo "==================================================================" \
+		&& $(COMPOSE) exec kafka kafka-console-consumer \
+			--bootstrap-server localhost:9092 \
+			--topic $$TOPIC_METER_READINGS_DLQ --from-beginning \
+			--timeout-ms 20000 2>/dev/null > /tmp/sg_dlq.json || true
+	@echo ""
+	@echo "Rejection reasons (should cover all four validation rules):"
+	@grep -o '"rejection_reason":"[a-z_]*"' /tmp/sg_dlq.json 2>/dev/null \
+		| sort | uniq -c | sort -rn || echo "  (no DLQ records yet)"
+	@echo ""
+	@echo "Sample records:"
+	@head -3 /tmp/sg_dlq.json 2>/dev/null || true
+	@echo ""
+	@echo "Total DLQ records: $$(wc -l < /tmp/sg_dlq.json 2>/dev/null || echo 0)"
+
+# The section 11 step 7 demo, and the most direct answer to the observability
+# criterion's "detect and diagnose pipeline failures" wording: one correlation id
+# followed from the moment the fault was deliberately injected, through Job A
+# rejecting it, to the DLQ record itself.
+trace:  ## Trace one correlation id end to end (make trace CID=<id>)
+	@test -n "$(CID)" || { echo "usage: make trace CID=<correlation_id>"; \
+		echo ""; echo "Pick one from an injected fault:"; \
+		$(COMPOSE) logs meter-simulator 2>/dev/null | grep fault_injected \
+			| tail -3 | grep -o '"correlation_id": "[^"]*"' || true; exit 1; }
+	@echo "=================================================================="
+	@echo "TRACING $(CID)"
+	@echo "=================================================================="
+	@echo ""
+	@echo "--- 1. PRODUCER (simulators/meter_simulator.py): fault injected ---"
+	@$(COMPOSE) logs meter-simulator 2>/dev/null | grep "$(CID)" || echo "  (not found)"
+	@echo ""
+	@echo "--- 2. PROCESSING (Job A): the batch that carried it ---"
+	@$(COMPOSE) logs job-a 2>/dev/null | grep "$(CID)" || \
+		echo "  (Job A logs per batch, not per record - see the DLQ record below)"
+	@echo ""
+	@echo "--- 3. DEAD-LETTER QUEUE: the rejected record and its reason ---"
+	@source .env && $(COMPOSE) exec kafka kafka-console-consumer \
+		--bootstrap-server localhost:9092 \
+		--topic $$TOPIC_METER_READINGS_DLQ --from-beginning \
+		--timeout-ms 20000 2>/dev/null | grep "$(CID)" || echo "  (not found)"
+
+parquet:  ## Show the curated Parquet archive partitions and row counts
+	@source .env \
+		&& echo "Curated archive: $$PARQUET_PATH" \
+		&& echo "" \
+		&& echo "Partitions (sim_date / grid_zone - the two predicates every replay" \
+		&& echo "and every daily report filters on, so pruning skips whole dirs):" \
+		&& curl -s "http://localhost:$$S3_API_HOST_PORT/$$S3_CURATED_BUCKET/?list-type=2&prefix=readings/&delimiter=/" \
+			| grep -o '<Prefix>[^<]*</Prefix>' | sed 's/<[^>]*>//g' | sort || true
+	@echo ""
+	@echo "Total objects and bytes under readings/:"
+	@source .env && curl -s "http://localhost:$$S3_API_HOST_PORT/$$S3_CURATED_BUCKET/?list-type=2&prefix=readings/" \
+		| grep -c "<Key>" | sed 's/^/  objects: /' || true
+
+spark-ui:  ## Print the Spark master UI URL
+	@source .env && echo "Spark master UI: http://localhost:$$SPARK_MASTER_UI_PORT"
+	@echo "  (shows the running Job A query, its executors and micro-batch history)"
+
+# The transform tests need a working Spark. PySpark's local mode requires a Hadoop
+# native environment (winutils.exe on Windows) that `pip install pyspark` does not
+# provide, so on some hosts those tests SKIP rather than fail - keeping `make test`
+# green on a clean clone. This target runs them where Spark is known to work, which
+# is also where the jobs actually run. It is part of the Phase 2 checkpoint, not an
+# optional extra: tests that only ever skip would prove nothing.
+test-spark:  ## Run the Spark transform tests inside the Spark container
+	@$(COMPOSE) run --rm --no-deps \
+		-e SIM_START_DATE=2026-01-01 -e SIM_DAY_REAL_SECONDS=300 \
+		--entrypoint sh job-a -c \
+		"pip install -q pytest >/dev/null 2>&1; cd /app && python3 -m pytest tests/unit/test_validation.py tests/unit/test_enrichment.py -q"
 
 test:  ## Run the unit test suite
 	python -m pytest tests/unit -v
