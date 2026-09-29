@@ -26,7 +26,8 @@ SHELL := /bin/bash
 COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 
 .PHONY: help env anchor up down ps logs topics psql s3 test clock clean \
-        consume compaction drop faults dlq trace parquet spark-ui test-spark
+        consume compaction drop faults dlq trace parquet spark-ui test-spark \
+        dev fast demo-config spark-base rebuild
 
 help:  ## Show available targets
 	@echo "Smart Grid Kappa Pipeline"
@@ -51,7 +52,7 @@ env:
 anchor: env
 	@now=$$(date -u +%Y-%m-%dT%H:%M:%SZ); 	if grep -q '^SIM_ANCHOR_REAL=' .env; then 		sed -i.bak "s|^SIM_ANCHOR_REAL=.*|SIM_ANCHOR_REAL=$$now|" .env && rm -f .env.bak; 	else 		echo "SIM_ANCHOR_REAL=$$now" >> .env; 	fi; 	start=$$(grep '^SIM_START_DATE=' .env | cut -d= -f2); 	echo "Simulated time anchored at $$now -> simulated day 0 = $$start"
 
-up: env anchor  ## Start the stack and create topics/buckets
+up: env anchor spark-base  ## Start the stack and create topics/buckets
 	$(COMPOSE) up -d --build
 	@echo ""
 	@echo "Waiting for the one-shot init containers to finish..."
@@ -306,6 +307,65 @@ test-spark:  ## Run the Spark transform tests inside the Spark container
 		-e SIM_START_DATE=2026-01-01 -e SIM_DAY_REAL_SECONDS=300 \
 		--entrypoint sh job-a -c \
 		"pip install -q pytest >/dev/null 2>&1; cd /app && python3 -m pytest tests/unit/test_validation.py tests/unit/test_enrichment.py -q"
+
+
+# ---------------------------------------------------------------------------
+# DEVELOPMENT SPEEDUPS
+#
+# These exist because Phase 2 showed the bottleneck was never the tests (the host
+# suite runs in 26 seconds) - it was image rebuilds and waiting on simulated-day
+# boundaries. Each target below removes one of those stalls.
+# ---------------------------------------------------------------------------
+
+# Build the expensive Spark layers (pip install + ~500 MB of connector JARs) ONCE.
+# `make up` and `make rebuild` depend on this; it only re-runs when a dependency or
+# connector version actually changes.
+spark-base:  ## Build the Spark base image (deps + JARs; slow, run once)
+	@if ! docker image inspect smartgrid-spark-base:latest >/dev/null 2>&1; then \
+		echo "Building smartgrid-spark-base (one-off, several minutes)..."; \
+		docker build -f docker/spark/Dockerfile.base -t smartgrid-spark-base:latest .; \
+	else \
+		echo "smartgrid-spark-base already present (delete it to force a rebuild)"; \
+	fi
+
+# Rebuild ONLY the thin application layer. ~5 seconds, versus ~6 minutes before the
+# base image was split out.
+rebuild: spark-base  ## Rebuild the Spark app image after a code change (~5s)
+	@docker build -q -f docker/spark/Dockerfile -t smartgrid-spark:latest . >/dev/null
+	@$(COMPOSE) up -d job-a
+	@echo "Rebuilt and restarted job-a."
+
+# Start the stack with the source tree bind-mounted, so a code edit needs only a
+# container restart and no rebuild at all. See docker-compose.dev.yml for the
+# trade-off: a bind-mounted stack is NOT reproducible from images alone, which is
+# why `make up` (the demo path) does not do this.
+dev: env anchor spark-base  ## Start with code bind-mounted (fast inner loop)
+	$(COMPOSE) -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+	@echo ""
+	@echo "Dev mode: code is bind-mounted."
+	@echo "  After editing a file:  docker compose restart job-a   (~20s, no rebuild)"
+	@echo "  For the demo, use:     make demo-config && make up"
+
+# Compress the simulated day so day-boundary behaviour (tariff drops, bill
+# generation, sim-day sealing) is observable in 1 real minute instead of 5.
+#
+# NOT for the demo: the report, the README and the logs all state
+# "1 simulated day = 5 real minutes", and that claim must hold when it is assessed.
+# `make demo-config` restores it, and this target prints the warning every time so
+# the change cannot be made and then forgotten.
+fast: env  ## Shorten the sim day to 60s for development (5x faster feedback)
+	@sed -i.bak 's/^SIM_DAY_REAL_SECONDS=.*/SIM_DAY_REAL_SECONDS=60/' .env && rm -f .env.bak
+	@echo "SIM_DAY_REAL_SECONDS=60  (1 sim day = 1 real minute)"
+	@echo ""
+	@echo "!! DEVELOPMENT ONLY. The report and README state 5 real minutes."
+	@echo "!! Run 'make demo-config' before recording the demo or taking screenshots."
+	@echo ""
+	@echo "Restart the stack for this to take effect:  make dev   (or make up)"
+
+demo-config: env  ## Restore the documented demo timings (1 sim day = 5 min)
+	@sed -i.bak 's/^SIM_DAY_REAL_SECONDS=.*/SIM_DAY_REAL_SECONDS=300/' .env && rm -f .env.bak
+	@echo "SIM_DAY_REAL_SECONDS=300  (1 sim day = 5 real minutes, as documented)"
+	@echo "Restart the stack for this to take effect:  make up"
 
 test:  ## Run the unit test suite
 	python -m pytest tests/unit -v

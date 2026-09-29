@@ -1,0 +1,65 @@
+# =============================================================================
+# DEVELOPMENT OVERLAY — faster inner loop. Never used for the demo.
+#
+# Applied with `make dev` (or `docker compose -f docker-compose.yml
+# -f docker-compose.dev.yml up -d`). Compose merges this over the base file.
+#
+# WHAT IT CHANGES AND WHY
+# -----------------------
+# The Spark jobs normally run code BAKED INTO the image, which is correct for a
+# reproducible demo: the image is self-contained, and what a marker runs is exactly
+# what was built. The cost is that every code edit needs a rebuild.
+#
+# This overlay bind-mounts the source directories over the baked-in copies instead,
+# so editing a Python file and running `docker compose restart job-a` (~20s) picks
+# up the change with no rebuild at all. During Phase 3 — where billing.py gets
+# iterated on heavily — that is the difference between a 20-second loop and a
+# multi-minute one.
+#
+# TRADE-OFF (deliberate): a bind-mounted container is NOT reproducible from the
+# image alone; it depends on the host's working tree. That is precisely why this is
+# a separate file rather than the default. `make up` uses the baked-in code, so the
+# reproducibility property being assessed is never quietly lost.
+#
+# :ro throughout — the containers read this code, they must never write to the
+# host's working tree.
+# =============================================================================
+
+services:
+  job-a:
+    volumes:
+      - ./processing:/app/processing:ro
+      - ./common:/app/common:ro
+      - ./simulators:/app/simulators:ro
+      - ./tests:/app/tests:ro
+      - spark-checkpoints:/data/checkpoints
+      - curated-archive:/data/curated
+
+  # Executors import the same modules as the driver, so the worker needs the same
+  # mounts. Without this the driver would run new code while executors ran old —
+  # which surfaces as a serialisation error rather than as an obvious staleness bug.
+  spark-worker:
+    volumes:
+      - ./processing:/app/processing:ro
+      - ./common:/app/common:ro
+      - ./simulators:/app/simulators:ro
+      - spark-checkpoints:/data/checkpoints
+      - curated-archive:/data/curated
+
+  meter-simulator:
+    volumes:
+      - ./common:/app/common:ro
+      - ./simulators:/app/simulators:ro
+
+  tariff-simulator:
+    volumes:
+      - ./common:/app/common:ro
+      - ./simulators:/app/simulators:ro
+      - drop-data:/data/drop
+
+  batch-loader:
+    volumes:
+      - ./common:/app/common:ro
+      - ./ingestion:/app/ingestion:ro
+      - ./simulators:/app/simulators:ro
+      - drop-data:/data/drop
