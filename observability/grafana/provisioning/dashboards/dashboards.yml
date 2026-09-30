@@ -1,0 +1,21 @@
+# =============================================================================
+# Dashboard provider. Loads every dashboard JSON from the mounted directory, so
+# adding a dashboard is adding a file — no UI step, no export/import dance.
+#
+# `allowUiUpdates: true` lets the panels be edited live during development and
+# then exported back over the file. `foldersFromFilesStructure` is off because
+# there are only two dashboards (Business now, Platform in Phase 6).
+# =============================================================================
+apiVersion: 1
+
+providers:
+  - name: smartgrid
+    orgId: 1
+    folder: SmartGrid
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

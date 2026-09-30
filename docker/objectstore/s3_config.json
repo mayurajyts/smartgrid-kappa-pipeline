@@ -19,6 +19,7 @@
     {
       "name": "anonymous",
       "actions": [
+        "Admin",
         "Read",
         "List",
         "Write"

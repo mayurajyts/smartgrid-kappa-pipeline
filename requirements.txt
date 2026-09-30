@@ -24,3 +24,14 @@ prometheus-client~=0.21
 
 # Tests
 pytest~=8.3
+
+# Serving API (Phase 4, section 9). FastAPI generates the OpenAPI page used in the
+# demo; uvicorn is its ASGI server.
+fastapi~=0.115
+uvicorn[standard]~=0.32
+
+# Postgres driver for the API. psycopg 3 (not psycopg2) for its connection pool,
+# which matters because the dashboard polls several panels every few seconds and
+# a per-request connect would dominate the latency budget (section 2.4).
+psycopg[binary]~=3.2
+psycopg-pool~=3.2

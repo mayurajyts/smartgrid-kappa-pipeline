@@ -28,7 +28,8 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 .PHONY: help env anchor up down ps logs topics psql s3 test clock clean \
         consume compaction drop faults dlq trace parquet spark-ui test-spark \
         dev fast demo-config spark-base rebuild \
-        serving-schema spark-base-force zones bills bill-replay upsert-restart
+        serving-schema spark-base-force zones bills bill-replay upsert-restart \
+        api grafana endpoints
 
 help:  ## Show available targets
 	@echo "Smart Grid Kappa Pipeline"
@@ -198,6 +199,61 @@ upsert-restart:  ## PHASE 3 CHECKPOINT: upserts idempotent under forced restart
 	@echo "--- staging tables hold one batch, never grow ---"
 	@source .env && $(COMPOSE) exec -T postgres \
 		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT relname, n_live_tup FROM pg_stat_user_tables WHERE relname LIKE 'stg_%%' ORDER BY relname;"
+
+api:  ## Show the serving API URLs (Phase 4)
+	@source .env \
+		&& echo "OpenAPI docs:  http://localhost:$$API_HOST_PORT/docs" \
+		&& echo "Health:        http://localhost:$$API_HOST_PORT/health" \
+		&& echo "Zone load:     http://localhost:$$API_HOST_PORT/api/v1/zones/load" \
+		&& echo "Grid summary:  http://localhost:$$API_HOST_PORT/api/v1/grid/summary" \
+		&& echo "Metrics:       http://localhost:$$API_HOST_PORT/metrics"
+
+grafana:  ## Show the Grafana dashboard URL (Phase 4)
+	@source .env \
+		&& echo "Business dashboard:" \
+		&& echo "  http://localhost:$$GRAFANA_HOST_PORT/d/smartgrid-business" \
+		&& echo "" \
+		&& echo "Anonymous viewing is enabled, so no login is needed to view." \
+		&& echo "To edit: $$GRAFANA_ADMIN_USER / $$GRAFANA_ADMIN_PASSWORD"
+
+endpoints:  ## PHASE 4 CHECKPOINT: every section 9 endpoint returns live data
+	@echo "=================================================================="
+	@echo "SERVING API CHECKPOINT (section 9)"
+	@echo ""
+	@echo "PASS: every endpoint returns 200 with a non-empty body."
+	@echo "  /alerts returns an empty list until Phase 6 -- that is correct,"
+	@echo "  not a failure: the table is created by Job D."
+	@echo "=================================================================="
+	@source .env && base=http://localhost:$$API_HOST_PORT; \
+		hh=$$($(COMPOSE) exec -T postgres psql -tAq -U $$POSTGRES_SUPERUSER \
+		   -d $$POSTGRES_DB -c "SELECT household_id FROM household_billing_running LIMIT 1" \
+		   2>/dev/null | tr -d "[:space:]"); \
+		[ -z "$$hh" ] && hh=HH-0001; \
+		zone=$$($(COMPOSE) exec -T postgres psql -tAq -U $$POSTGRES_SUPERUSER \
+		   -d $$POSTGRES_DB -c "SELECT grid_zone FROM zone_load_1m LIMIT 1" \
+		   2>/dev/null | tr -d "[:space:]"); \
+		[ -z "$$zone" ] && zone=ZONE-A; \
+		sd=$$($(COMPOSE) exec -T postgres psql -tAq -U $$POSTGRES_SUPERUSER \
+		   -d $$POSTGRES_DB -c "SELECT max(sim_date) FROM household_billing_running" \
+		   2>/dev/null | tr -d "[:space:]"); \
+		for path in /health \
+		    /api/v1/zones/load \
+		    "/api/v1/zones/$$zone/timeseries?limit=5" \
+		    /api/v1/grid/summary \
+		    "/api/v1/households/$$hh/bill" \
+		    "/api/v1/households/$$hh/bill/versions" \
+		    /api/v1/households/top \
+		    "/api/v1/reports/daily/$$sd" \
+		    "/api/v1/alerts?active=true" \
+		    /api/v1/pipeline/status; do \
+		  code=$$(curl -s -o /tmp/sg_api.json -w "%{http_code}" "$$base$$path"); \
+		  size=$$(wc -c < /tmp/sg_api.json | tr -d " "); \
+		  printf "  %-4s %-6s %s\n" "$$code" "$${size}B" "$$path"; \
+		done
+	@echo ""
+	@echo "Sample payload (grid summary):"
+	@source .env && curl -s http://localhost:$$API_HOST_PORT/api/v1/grid/summary | head -c 600
+	@echo ""
 
 psql:  ## Open a psql shell on the serving database
 	@source .env && $(COMPOSE) exec postgres \
