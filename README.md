@@ -70,8 +70,9 @@ Lambda would be the right answer are in
 | GNU Make | 4+ | on Windows, use Git Bash or WSL |
 | Python | 3.11+ | only needed to run the unit tests on the host |
 
-Allocate Docker at least **6 GB of memory** — Kafka, Spark and Airflow together
-need it in later phases.
+Allocate Docker at least **4 GB of memory**; **6 GB** is comfortable. The full
+stack measures around 2.5 GB at rest, and the tight part is three Spark drivers
+plus Airflow running at the same time.
 
 > On a machine with 8 GB of RAM or less, cap the WSL2 backend explicitly in
 > `%USERPROFILE%\.wslconfig` (`[wsl2]` / `memory=4GB`). Without a cap WSL grows on
@@ -85,296 +86,210 @@ need it in later phases.
 ## Quick start
 
 ```bash
-git clone <this-repo> && cd smartgrid-kappa-pipeline
-make up
+make demo
 ```
 
-`make up` copies `.env.example` to `.env` if it is missing, builds and starts
-the stack, and waits for the one-shot init containers to create the Kafka topics
-and the MinIO bucket.
+One command. It builds every image, starts all sixteen long-running services (plus three one-shot init containers), applies the
+serving schema, waits for the API to report healthy, and prints the demo URLs in
+the order §11 walks through them.
+
+First run pulls images and can take several minutes. Later runs take about a
+minute.
+
+Then prove it works:
 
 ```bash
-make help     # list every target
-make ps       # container status
-make topics   # topic inventory and configuration
-make logs     # tail everything (make logs S=kafka for one service)
-make s3       # object store endpoints and buckets
-make consume  # show events on all three topics
-make dlq      # rejected records grouped by reason
-make trace CID=<id>   # follow one record end to end
-make parquet  # curated archive partitions
-make spark-ui # Spark master UI URL
-make faults   # show the deliberately injected faults
-make drop     # list the daily-feed drop directory
-make test     # run the unit tests
-make down     # stop, keeping all data
-make clean    # stop and DESTROY all data (prompts first)
+make smoke
 ```
+
+Fifteen checks across every layer — Kafka offsets, the Spark aggregates, the
+serving tables, the Airflow artifacts, the API, Prometheus targets and the alert
+rules. It exits non-zero if any layer is broken, so it is also the thing to run
+after a change.
+
+### What you get
+
+| URL | What it shows |
+|---|---|
+| `localhost:3000/d/smartgrid-business` | Zone load, renewable mix, meter coverage, bills |
+| `localhost:3000/d/smartgrid-platform` | Throughput, reject rate, latency, consumer lag |
+| `localhost:8080/docs` | Interactive API page, all ten §9 endpoints |
+| `localhost:8081` | Airflow — the four DAGs (`admin`/`admin`) |
+| `localhost:9090/alerts` | Prometheus alert rules and their state |
+| `localhost:9093` | Alertmanager |
+| `localhost:8090` | Spark master |
+
+`make demo-urls` reprints that list at any time.
 
 ---
 
-## Current status: Phase 2 (Job A) complete
+## Status: all build phases complete
 
-The build follows the eight phases in
-[`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) §10.
-
-| Phase | Scope | Status |
+| Phase | Deliverable | Verified by |
 |---|---|---|
-| 0 | Scaffold: Compose infra, `common/`, Makefile | ✅ complete |
-| 1 | Simulators + batch loader | ✅ complete |
-| 2 | Job A — clean, validate, dedupe, enrich, DLQ | ✅ complete |
-| 3 | Jobs B & C — zone aggregates, household billing | pending |
-| 4 | Serving: Postgres schema, FastAPI, Grafana | pending |
-| 5 | Airflow: sealing, daily report, replay | pending |
-| 6 | Observability: metrics, alert rules, tracing | pending |
-| 7 | Hardening: tests, `make demo` | pending |
-| 8 | Report & demo | pending |
+| 0 | Kafka (KRaft), Postgres, object store, `common/`, Makefile | `make topics` |
+| 1 | Meter + tariff/weather simulators, fault injection, batch loader | `make consume` `make faults` |
+| 2 | Job A — validate, dedupe, enrich, DLQ, Parquet archive | `make dlq` `make parquet` |
+| 3 | Jobs B & C — zone aggregates, household billing, idempotent upserts | `make zones` `make bills` |
+| 4 | FastAPI serving layer, Grafana business dashboard | `make endpoints` |
+| 5 | Four Airflow DAGs, sim-day sealing, daily report, replay | `make dags` `make report` |
+| 6 | Prometheus, seven alert rules, Alertmanager, platform dashboard | `make metrics` `make alerts` |
+| 7 | `make demo`, `make smoke`, README, config externalised | `make smoke` |
 
+Test suite: **235 host tests** (`make test`, no infrastructure needed) plus
+**60 Spark transform tests** (`make test-spark`, in-container).
 
+---
 
-### Verifying the Phase 2 checkpoint
+## The headline demonstration: bill restatement (R7)
 
-> *"Injected bad records land in DLQ with correct reasons; restarting the job does
-> not duplicate Parquet output."*
-
-**1. Job A is processing, with a reject rate matching the producer's design.**
+This is the architecture decision made concrete, and it is §11's finale.
 
 ```bash
-docker compose logs job-a | grep stage_boundary | tail -3
+make versions     # one version per day, the current one flagged
+make restate      # publish a restatement: re-price and issue version N+1
+make versions     # version 1 superseded, version 2 current, BOTH readable
 ```
 
-Each line reports `records_in`, `records_out`, `records_rejected` and a running
-`reject_rate_pct`. In steady state this sits at **~0.74%** against the producer's
-designed 0.8% — the strongest single piece of evidence that validation is rejecting
-the injected faults and nothing else. A materially higher rate would mean good data
-was being discarded; a lower one, that faults were slipping through.
+A restated bill is never an `UPDATE`. It is a new row at version N+1 plus one
+transaction that flips `is_current`, so "what did we invoice, and what did we
+correct it to" is answerable from the table itself. A partial unique index
+enforces that exactly one version is ever live, so a mistake fails loudly rather
+than leaving two current bills.
 
-> The **first** batch after a cold start is different: it drains the backlog that
-> accumulated before Job A subscribed, and those readings are old enough in
-> *simulated* time (which runs 288× faster) to trip the future-timestamp rule. That
-> batch alone can show a high reject rate. It is transient, and it is why the steady
-> state is quoted above.
+Both the streaming job and the restatement DAG price bills by calling
+`processing/transforms/billing.py`. Not a copy of it — the same module. That is
+the whole "why not Lambda" argument in one file, and it is checkable: the DAG's
+re-pricing reproduces the stream's stored cost to the cent.
 
-**2. Bad records land in the DLQ with the correct reasons.**
+---
+
+## Verifying each layer
+
+Every phase has a make target that prints its own pass criteria, so a claim in
+this README can be checked rather than taken on trust.
+
+### Processing (Phase 3)
 
 ```bash
-make dlq
+make zones     # zone aggregates; asserts the window span is 288 sim-minutes
+make bills     # running bills; asserts running_cost IS NULL iff tariff_missing
 ```
 
-All four rejection classes should appear: `null_required_field`, `negative_kwh`,
-`solar_above_capacity`, `timestamp_in_future`. The reason strings are *imported*
-from `simulators/fault_injection.py` rather than duplicated, so an injected fault
-and its DLQ record are provably the same event — `tests/unit/test_validation.py`
-asserts that correspondence directly.
+`make upsert-restart` is the stronger one: it SIGKILLs Job B mid-batch, restarts
+it, and compares settled windows against a baseline. Zero differing rows and zero
+duplicate keys is the pass — at-least-once delivery becoming effectively-once
+storage, which is what the `ON CONFLICT DO UPDATE` sink is for.
 
-**3. Trace one record end to end** — the §11 step 7 demo:
+### Serving (Phase 4)
 
 ```bash
+make endpoints   # all ten §9 endpoints, with status and payload size
+```
+
+### Orchestration (Phase 5)
+
+```bash
+make dags        # DAG list, the sim-day lifecycle table, recent audit rows
+make report      # the generated CSV and HTML, and issued bills by version
+```
+
+### Observability (Phase 6)
+
+```bash
+make metrics     # scrape targets and key metric values
+make alerts      # all seven rules and their state
+```
+
+`inactive` means the condition is false (healthy). `pending` means it is true and
+waiting out its `for:` duration. `LowRenewableContribution` pending overnight in
+simulated time is **correct** — that is the diurnal cycle, not a fault.
+
+To see an alert actually fire (§11 step 6):
+
+```bash
+docker compose stop meter-simulator
+# NoDataReceived fires within ~2 minutes; watch localhost:9093
+docker compose up -d meter-simulator
+```
+
+### Tracing one record end to end (§11 step 7)
+
+```bash
+make dlq                      # rejected records grouped by reason
 make trace CID=<correlation_id>
 ```
 
-Take a correlation id from any `fault_injected` line in the simulator's logs and
-watch it appear on the matching DLQ record.
-
-**4. The curated Parquet archive is partitioned correctly.**
-
-```bash
-docker compose exec spark-worker \
-  find /data/curated/readings -type d -name "grid_zone=*" | head
-```
-
-Expect `sim_date=YYYY-MM-DD/grid_zone=ZONE-X`. Note this runs against
-**`spark-worker`**, not `job-a`: Spark *executors* write the files, and the driver
-container never sees them.
-
-**5. Restart idempotence — the second half of the checkpoint.**
-
-```bash
-docker compose exec spark-worker find /data/curated -name "*.parquet" | wc -l
-docker compose restart job-a
-# wait ~60s for it to resume from its checkpoint
-docker compose exec spark-worker find /data/curated -name "*.parquet" | wc -l
-```
-
-The count must grow **only** by genuinely new readings — no already-archived batch
-is rewritten. Verified: 1650 files before the restart, 1650 immediately after, then
-growing normally as the simulator continued.
-
-**6. Transform tests.**
-
-```bash
-make test         # host suite
-make test-spark   # the 60 Spark transform tests, inside the Spark container
-```
-
-`make test-spark` matters: PySpark's local mode needs a Hadoop native environment
-(`winutils.exe` on Windows) that `pip install pyspark` does not provide, so the
-Spark tests **skip** on some hosts. They genuinely execute inside the container,
-which is also where the jobs run.
-
-### Verifying the Phase 1 checkpoint
-
-> *"`kafka-console-consumer` shows well-formed events on all three topics; tariff
-> topic compacts correctly."*
-
-**1. All three topics carry well-formed events.**
-
-```bash
-make consume
-```
-
-`meter.readings.v1` fills immediately, keyed by `grid_zone`. The two reference
-topics stay **empty for the first ~5 real minutes** — that is correct, not a
-failure: §14 specifies that day *D*'s tariff is delivered at the start of day
-*D+1*, so the first simulated day genuinely has no tariff. This is what exercises
-Job C's explicit choice to write the running kWh with `tariff_rate = NULL` rather
-than invent a rate.
-
-**2. The tariff topic compacts by key.** This is the mechanism the whole Kappa
-argument rests on, so it gets its own target:
-
-```bash
-make compaction    # takes ~2 min: it must force a segment roll
-```
-
-It publishes a *corrected* tariff for one household under the same key, then shows
-only the corrected value surviving. A restatement is an **append, never an
-update** — which is exactly how R7 is satisfied without a second processing
-engine.
-
-The target deliberately forces a segment roll, because Kafka's log cleaner never
-compacts the **active** segment. Publishing a correction and simply waiting shows
-both versions indefinitely and looks like compaction is broken when it is working
-as designed.
-
-**3. Deliberate faults are being injected** — these are the fixtures Phase 2's DLQ
-and Phase 3's deduplication are built to catch:
-
-```bash
-make faults
-```
-
-| Fault | Rate | What it exercises |
-|---|---|---|
-| `null_required_field` | 0.2% | Job A DLQ → `null_required_field` |
-| `negative_kwh` | 0.2% | Job A DLQ → `negative_kwh` |
-| `solar_above_capacity` | 0.2% | Job A DLQ → `solar_above_capacity` |
-| `timestamp_in_future` | 0.2% | Job A DLQ → `timestamp_in_future` |
-| `duplicate` | 1.0% | `dropDuplicates(["event_id"])` |
-| `late_event` | 1.0% | the 2-minute watermark (back-dated 4 sim min) |
-| `meter_dropout` | 0.1% | `METER_SILENT` alert, `NoDataReceived` rule |
-
-The four rejection faults sum to **0.8%**, deliberately below the 2% data-quality
-gate the Airflow DAG enforces (§7) — larger values would make the pipeline fail its
-own gate by design. Every injected fault logs its `correlation_id`, so a DLQ record
-found in Phase 2 can be traced back to the exact moment it was created. That is the
-§11 step 7 trace demo.
-
-**4. The daily file feed lands and is loaded.**
-
-```bash
-make drop
-```
-
-Expect a `tariff_<sim_date>.csv` / `weather_<sim_date>.json` pair per completed
-simulated day, plus a `.processed` marker per loaded file. Files are written to a
-temp name and atomically renamed, so the polling loader can never read a
-half-written file.
-
-**5. Per-zone ordering holds.** Kafka orders only *within* a partition, so the
-1-minute tumbling zone aggregates depend on each zone's records staying on one
-partition:
-
-```bash
-source .env && docker compose exec kafka kafka-console-consumer \
-  --bootstrap-server localhost:9092 --topic $TOPIC_METER_READINGS \
-  --partition 0 --from-beginning --max-messages 20 \
-  --property print.key=true --property print.value=false
-```
-
-Every key on a given partition is the same zone. Note that with 5 zone keys across
-6 partitions, some partitions are empty and two zones may share one — both are
-correct: the guarantee needed is per-zone ordering, not one-zone-per-partition.
-
-**6. Unit tests pass.**
-
-```bash
-make test
-```
-
-### Verifying the Phase 0 checkpoint
-
-> *"`make up` brings up infra; topics created with correct compaction settings."*
-
-**1. Services are healthy and the init tasks completed.**
-
-```bash
-make ps
-```
-
-`kafka`, `postgres` and `minio` should show `healthy`; `kafka-init` and
-`minio-init` should show `Exited (0)` — they are one-shot tasks, not services.
-
-**2. Topics exist with the settings the architecture depends on.**
-
-```bash
-make topics
-```
-
-Two things in that output are load-bearing, not incidental:
-
-- `cleanup.policy=compact` on **`tariff.reference.v1`** and
-  **`weather.forecast.v1`**. Compaction retains the latest value per key
-  forever, which *is* the broadcast dimension that the stream-static join in Job
-  C reads. Without it the tariff data ages out and bills silently lose their
-  tariff.
-- `PartitionCount: 6` on **`meter.readings.v1`**. Kafka guarantees ordering only
-  within a partition, so keying by `grid_zone` across 6 partitions is what gives
-  the per-zone ordering the 1-minute tumbling aggregates rely on.
-
-**3. Both databases exist.**
-
-```bash
-make psql    # then: \l
-```
-
-Expect `smartgrid` (serving store) and `airflow` (orchestration metadata) —
-isolated by database on one instance.
-
-**4. The curated bucket exists.**
-
-```bash
-make s3   # prints the endpoints and lists the buckets
-```
-
-Expect `smartgrid-curated` in the `ListAllMyBucketsResult`.
-
-**5. Unit tests pass.**
-
-```bash
-make test
-```
-
-**6. The simulated clock reports correctly.**
-
-```bash
-make clock
-```
-
-Expect `sim_start=2026-01-01` and a current `sim_date` on or shortly after it —
-**not** a far-future date. Both anchors are printed so you can see which real
-moment the simulated timeline was pinned to.
-
-**7. Reproducibility — the property actually being assessed.**
-
-```bash
-make clean && make up
-```
-
-The stack must reach the same state from empty volumes.
+A `correlation_id` is minted by the producer and carried through every stage and
+onto the DLQ record, so one rejected reading can be followed from ingestion to
+rejection across service logs. That single demonstration is what the
+observability criterion asks for.
 
 ---
 
+## Timing: the one thing to get right
+
+**The simulated clock is 288× wall clock, and almost every confusing observation
+traces back to forgetting that.**
+
+Three separate bugs in this project were the same mistake — a duration left on
+the wrong axis:
+
+- A watermark specified as "2 minutes" is **0.42 real seconds** at 288×, which is
+  shorter than one micro-batch, so the stateful operator drops nearly everything.
+- A future-timestamp tolerance of "5 minutes" is **1.04 real seconds**, less than
+  Kafka transit plus one micro-batch — so 100% of readings get rejected as
+  future-dated and the clean topic silently stops growing.
+- A "1 minute" tumbling window would write **~86,400 rows per real minute**.
+
+The convention that resolves it: **every duration is declared in REAL minutes and
+multiplied by `compression_ratio()`** inside the job. Job B additionally asserts
+the watermark/window/batch-span relationship at startup and refuses to run if it
+breaks, so a tuning change cannot silently halve the output.
+
+`tests/unit/test_time_budgets.py` pins these relationships as pure arithmetic —
+thirteen tests that run on the host and never skip.
+
+Two commands worth knowing:
+
+```bash
+make fast          # 1 sim day = 60s, for development
+make demo-config   # 1 sim day = 300s, the documented timing — run before any demo
+```
+
+`make demo` runs `demo-config` for you.
+
+---
+
+## Development
+
+```bash
+make dev        # code bind-mounted; edit and restart, no rebuild
+make rebuild    # rebuild the thin Spark image (~5s) and restart jobs A/B/C
+make test       # 235 host tests (~30s)
+make test-spark # 60 Spark transform tests, in-container
+```
+
+`make up` bakes code into images (reproducible, for the demo); `make dev`
+bind-mounts it (fast, not reproducible from images alone). That separation is
+deliberate.
+
+The Spark image is split in two: a base with the dependencies and ~500 MB of
+JARs, and a thin layer with the application code. A code change rebuilds in about
+five seconds rather than six minutes. **A change to the base — a new JAR or pip
+dependency — needs `make spark-base-force`**; `make rebuild` will not pick it up.
+
+### If Docker wedges
+
+On a memory-constrained host, Docker can reach a state where every API call
+returns `500 Internal Server Error`. Recovery: stop Docker Desktop, run
+`wsl --shutdown`, start Docker Desktop.
+
+The stack needs roughly 2.5 GB. `%USERPROFILE%\.wslconfig` caps it; raise
+`memory=` toward 5 GB if you have the headroom, since three Spark drivers plus
+Airflow is the tight part.
+
+---
 
 ## The simulated world
 

@@ -31,7 +31,8 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
         serving-schema spark-base-force zones bills bill-replay upsert-restart \
         api grafana endpoints \
         airflow dags report restate versions \
-        metrics alerts observability
+        metrics alerts observability \
+        demo demo-urls smoke bucket
 
 help:  ## Show available targets
 	@echo "Smart Grid Kappa Pipeline"
@@ -385,6 +386,141 @@ alerts:  ## PHASE 6 CHECKPOINT: alert rules loaded and their state
 		[print('  %s %s' % (x['labels'].get('alertname'), \
 		  x['labels'].get('grid_zone',''))) for x in a]" 2>/dev/null \
 		|| echo "  (alertmanager not reachable)"
+
+bucket:  ## Create the curated archive bucket (only needed on a foreign store)
+	@# The init container creates this automatically: the anonymous S3 identity
+	@# is granted Admin in docker/objectstore/s3_config.json precisely so that a
+	@# clean clone works (see docker/objectstore/README.md). This target exists as
+	@# a manual fallback for a store whose identity config differs.
+	@source .env && echo "s3.bucket.create -name $$S3_CURATED_BUCKET" \
+		| $(COMPOSE) exec -T objectstore weed shell -master=localhost:9333 \
+		2>&1 | tail -2
+
+demo: env anchor spark-base  ## ONE COMMAND: bring the whole platform up and print the demo URLs
+	@echo "=================================================================="
+	@echo "SMART GRID KAPPA PLATFORM - full stack"
+	@echo ""
+	@echo "1 simulated day = 300 real seconds (288x compression)."
+	@echo "Building and starting 16 services. First run pulls images and can"
+	@echo "take several minutes; later runs take about a minute."
+	@echo "=================================================================="
+	@$(MAKE) --no-print-directory demo-config
+	$(COMPOSE) up -d --build
+	@echo ""
+	@echo "Waiting for the one-shot init containers..."
+	@for i in $$(seq 1 90); do \
+		running=$$($(COMPOSE) ps --status running --services 2>/dev/null \
+		  | grep -E '^(kafka-init|objectstore-init|base-image)$$' || true); \
+		[ -z "$$running" ] && break; \
+		sleep 2; \
+		done
+	@$(MAKE) --no-print-directory serving-schema
+	@echo ""
+	@echo "Waiting for the serving API to report healthy..."
+	@source .env && for i in $$(seq 1 60); do \
+		curl -sf "http://localhost:$$API_HOST_PORT/health" >/dev/null 2>&1 \
+		  && break; \
+		sleep 3; \
+		done
+	@echo ""
+	@$(MAKE) --no-print-directory ps
+	@$(MAKE) --no-print-directory demo-urls
+
+demo-urls:  ## Print every UI and endpoint, in demo order (section 11)
+	@source .env \
+		&& echo "==================================================================" \
+		&& echo "DEMO SCRIPT (section 11) - open these in order" \
+		&& echo "==================================================================" \
+		&& echo "" \
+		&& echo "  2. Business dashboard (zone load, renewable mix, bills)" \
+		&& echo "     http://localhost:$$GRAFANA_HOST_PORT/d/smartgrid-business" \
+		&& echo "" \
+		&& echo "  3. Serving API (interactive OpenAPI page)" \
+		&& echo "     http://localhost:$$API_HOST_PORT/docs" \
+		&& echo "     make endpoints   # all ten section 9 endpoints at once" \
+		&& echo "" \
+		&& echo "  4/6. Alerts firing" \
+		&& echo "     http://localhost:$$PROMETHEUS_HOST_PORT/alerts" \
+		&& echo "     http://localhost:$$ALERTMANAGER_HOST_PORT" \
+		&& echo "     make alerts" \
+		&& echo "" \
+		&& echo "  5. Airflow - the daily report DAG" \
+		&& echo "     http://localhost:$$AIRFLOW_HOST_PORT  ($$AIRFLOW_ADMIN_USER/$$AIRFLOW_ADMIN_PASSWORD)" \
+		&& echo "     make dags ; make report" \
+		&& echo "" \
+		&& echo "  7. Trace one rejected record end to end" \
+		&& echo "     make dlq ; make trace CID=<correlation_id>" \
+		&& echo "" \
+		&& echo "  8. THE FINALE - bill restatement (R7)" \
+		&& echo "     make restate ; make versions" \
+		&& echo "" \
+		&& echo "  Platform view:   http://localhost:$$GRAFANA_HOST_PORT/d/smartgrid-platform" \
+		&& echo "  Spark master:    http://localhost:$$SPARK_MASTER_UI_PORT" \
+		&& echo "=================================================================="
+
+smoke:  ## PHASE 7 CHECKPOINT: one command that proves the whole platform works
+	@echo "=================================================================="
+	@echo "END-TO-END SMOKE TEST"
+	@echo ""
+	@echo "Checks every layer in one pass: sources -> Kafka -> Spark ->"
+	@echo "Postgres -> API -> Prometheus, plus the Airflow artifacts."
+	@echo "=================================================================="
+	@fail=0; \
+		source .env; \
+		check() { printf "  %-46s " "$$1"; shift; \
+		  if out=$$("$$@" 2>/dev/null) && [ -n "$$out" ] && [ "$$out" != "0" ]; \
+		  then echo "PASS  ($$out)"; else echo "FAIL"; fail=1; fi; }; \
+		pq() { $(COMPOSE) exec -T postgres psql -tAq \
+		  -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "$$1" | tr -d "[:space:]"; }; \
+		echo "  --- ingestion ---"; \
+		check 'raw topic has records' sh -c \
+		  "$(COMPOSE) exec -T kafka kafka-get-offsets --bootstrap-server localhost:9092 \
+		   --topic $$TOPIC_METER_READINGS --time -1 2>/dev/null \
+		   | awk -F: '{s+=\$$3} END {print s}'"; \
+		check 'clean topic has records' sh -c \
+		  "$(COMPOSE) exec -T kafka kafka-get-offsets --bootstrap-server localhost:9092 \
+		   --topic $$TOPIC_METER_READINGS_CLEAN --time -1 2>/dev/null \
+		   | awk -F: '{s+=\$$3} END {print s}'"; \
+		check 'tariff topic compacted (one per household)' sh -c \
+		  "$(COMPOSE) exec -T kafka kafka-get-offsets --bootstrap-server localhost:9092 \
+		   --topic $$TOPIC_TARIFF_REFERENCE --time -1 2>/dev/null \
+		   | awk -F: '{s+=\$$3} END {print s}'"; \
+		echo "  --- processing -> serving store ---"; \
+		check 'zone_load_1m rows (Job B)' pq 'SELECT count(*) FROM zone_load_1m'; \
+		check 'window span is 288 sim-minutes' pq \
+		  'SELECT DISTINCT extract(epoch FROM (window_end-window_start))/60 FROM zone_load_1m'; \
+		check 'household_billing_running rows (Job C)' pq \
+		  'SELECT count(*) FROM household_billing_running'; \
+		check 'priced bills exist' pq \
+		  'SELECT count(running_cost) FROM household_billing_running'; \
+	check 'curated Parquet archive has committed files' sh -c \
+	  '$(COMPOSE) exec -T spark-worker sh -c "find /data/curated -name \"*.parquet\" | wc -l"'; \
+		echo "  --- orchestration ---"; \
+		check 'sim days sealed' pq \
+		  'SELECT count(*) FROM sim_day_state WHERE sealed_at IS NOT NULL'; \
+		check 'issued bills (household_billing_daily)' pq \
+		  'SELECT count(*) FROM household_billing_daily'; \
+	check 'report artifacts written' sh -c \
+	  '$(COMPOSE) exec -T airflow sh -c "ls /data/reports | wc -l"'; \
+		echo "  --- serving ---"; \
+		check 'API /health' sh -c \
+		  "curl -s -o /dev/null -w '%{http_code}' http://localhost:$$API_HOST_PORT/health"; \
+		check 'API /api/v1/zones/load' sh -c \
+		  "curl -s -o /dev/null -w '%{http_code}' http://localhost:$$API_HOST_PORT/api/v1/zones/load"; \
+		check 'Grafana healthy' sh -c \
+		  "curl -s http://localhost:$$GRAFANA_HOST_PORT/api/health | grep -c ok"; \
+		echo "  --- observability ---"; \
+		check 'Prometheus targets up' sh -c \
+		  "curl -s 'http://localhost:$$PROMETHEUS_HOST_PORT/api/v1/targets?state=active' \
+		   | python -c \"import json,sys; print(len([t for t in \
+		   json.load(sys.stdin)['data']['activeTargets'] if t['health']=='up']))\""; \
+		check 'alert rules loaded' sh -c \
+		  "curl -s http://localhost:$$PROMETHEUS_HOST_PORT/api/v1/rules \
+		   | python -c \"import json,sys; print(sum(len(g['rules']) for g in \
+		   json.load(sys.stdin)['data']['groups']))\""; \
+		echo ""; \
+		[ $$fail -eq 0 ] && echo "  ALL CHECKS PASSED" \
+		  || { echo "  SOME CHECKS FAILED - see above"; exit 1; }
 
 psql:  ## Open a psql shell on the serving database
 	@source .env && $(COMPOSE) exec postgres \

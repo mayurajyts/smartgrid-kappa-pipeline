@@ -446,6 +446,12 @@ services:
       # The worker needs the checkpoint volume too: executors write state store
       # files there, not only the driver.
       - spark-checkpoints:/data/checkpoints
+      # The curated Parquet archive. REQUIRED HERE, not only on job-a:
+      # Parquet is written by the EXECUTORS, which run in this container, so
+      # without this mount every task writes into a container-local path and
+      # the commit leaves a _temporary directory with zero committed files.
+      # Symptom: the clean topic grows normally while the archive stays empty.
+      - curated-archive:/data/curated
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
