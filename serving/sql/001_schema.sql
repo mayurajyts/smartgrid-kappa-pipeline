@@ -325,3 +325,81 @@ CREATE TABLE IF NOT EXISTS stg_job_b_zone_aggregates_zone_load_1m
 
 CREATE TABLE IF NOT EXISTS stg_job_c_household_billing_household_billing_running
     (LIKE household_billing_running);
+
+
+-- ============================================================================
+-- Phase 5 additions — Airflow's orchestration state.
+--
+-- `sim_day_state` was listed in §6.5 but deliberately left out until now: it is
+-- written by the DAGs, and creating a table before the code that writes it
+-- exists means shipping a contract nobody has validated against a real writer.
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- sim_day_state — the lifecycle of one simulated day (§6.5).
+--
+-- WHY A TABLE RATHER THAN AIRFLOW'S OWN RUN HISTORY: Airflow knows when a DAG
+-- ran; it does not know whether the simulated day that run was ABOUT is sealed,
+-- whether its tariff arrived, or whether its report was produced. That is
+-- domain state, and the billing DAG's sensor gates on it.
+--
+-- It is also what makes the sealing idempotent: `seal_sim_day` upserts here, so
+-- re-running it for a day already sealed is a no-op rather than a second seal.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sim_day_state (
+    sim_date              DATE        NOT NULL PRIMARY KEY,
+
+    opened_at             TIMESTAMPTZ,
+
+    -- Set once the day is complete and no further readings for it are expected.
+    -- Until then the billing DAG must not issue an invoice, because the running
+    -- totals are still moving.
+    sealed_at             TIMESTAMPTZ,
+
+    -- When the D+1 reference feeds landed (§14). The billing DAG's sensor waits
+    -- on tariff_received_at; a bill cannot be priced before it.
+    tariff_received_at    TIMESTAMPTZ,
+    weather_received_at   TIMESTAMPTZ,
+
+    report_generated_at   TIMESTAMPTZ,
+
+    -- open | sealed | reported. Denormalised from the timestamps above so the
+    -- dashboard and the API can filter without expressing the precedence rules.
+    status                TEXT        NOT NULL DEFAULT 'open',
+
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS sim_day_state_status_idx
+    ON sim_day_state (status, sim_date DESC);
+
+-- ----------------------------------------------------------------------------
+-- Phase 5 addition to household_billing_running: persist the tariff Job C used.
+--
+-- WHY: the issued bill (household_billing_daily) must be priced against the
+-- tariff that was authoritative for the sealed day, and §6.5's running table
+-- holds only the resulting cost. Without these columns the billing DAG would
+-- have to INFER the tier from consumption -- but the tariff feed assigns tier
+-- from a household's base_load_kw (see simulators/tariff_simulator.py), not from
+-- its daily draw, so inference would disagree with the feed for most
+-- households and version 1 would be priced at the wrong rate.
+--
+-- Storing what Job C actually joined makes the issued bill reproducible from the
+-- serving store alone, and makes a restatement a genuine comparison: version 2
+-- differs from version 1 because the RATE changed, which is visible in these
+-- columns rather than inferred.
+--
+-- ALTER rather than a new table, and IF NOT EXISTS so the file stays re-runnable.
+-- ----------------------------------------------------------------------------
+ALTER TABLE household_billing_running
+    ADD COLUMN IF NOT EXISTS tariff_rate  NUMERIC(10, 4),
+    ADD COLUMN IF NOT EXISTS billing_tier TEXT,
+    ADD COLUMN IF NOT EXISTS subsidy_flag BOOLEAN;
+
+-- The staging table must match the target's shape, or the JDBC writer's
+-- column list and the MERGE disagree. Recreated by LIKE would lose nothing here
+-- (staging is truncated every batch), but ALTER keeps it in step without a drop.
+ALTER TABLE stg_job_c_household_billing_household_billing_running
+    ADD COLUMN IF NOT EXISTS tariff_rate  NUMERIC(10, 4),
+    ADD COLUMN IF NOT EXISTS billing_tier TEXT,
+    ADD COLUMN IF NOT EXISTS subsidy_flag BOOLEAN;

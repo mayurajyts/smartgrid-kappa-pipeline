@@ -29,7 +29,9 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
         consume compaction drop faults dlq trace parquet spark-ui test-spark \
         dev fast demo-config spark-base rebuild \
         serving-schema spark-base-force zones bills bill-replay upsert-restart \
-        api grafana endpoints
+        api grafana endpoints \
+        airflow dags report restate versions \
+        metrics alerts observability
 
 help:  ## Show available targets
 	@echo "Smart Grid Kappa Pipeline"
@@ -254,6 +256,135 @@ endpoints:  ## PHASE 4 CHECKPOINT: every section 9 endpoint returns live data
 	@echo "Sample payload (grid summary):"
 	@source .env && curl -s http://localhost:$$API_HOST_PORT/api/v1/grid/summary | head -c 600
 	@echo ""
+
+airflow:  ## Show the Airflow UI URL and DAG list (Phase 5)
+	@source .env \
+		&& echo "Airflow UI:  http://localhost:$$AIRFLOW_HOST_PORT" \
+		&& echo "Login:       $$AIRFLOW_ADMIN_USER / $$AIRFLOW_ADMIN_PASSWORD" \
+		&& echo ""
+	@$(COMPOSE) exec -T airflow airflow dags list 2>/dev/null \
+		| grep -E "smartgrid|dag_id|seal|billing|quality|replay" || \
+		echo "  (airflow not running yet - try: docker compose up -d airflow)"
+
+dags:  ## PHASE 5 CHECKPOINT: DAG state and recent runs
+	@echo "=================================================================="
+	@echo "AIRFLOW DAGS (section 7)"
+	@echo ""
+	@echo "  seal_sim_day         every 2 real min - declares a sim-day complete"
+	@echo "  data_quality_checks  every 5 real min - reject rate / coverage / kWh"
+	@echo "  daily_billing_report every 5 real min - issues version 1 of a bill"
+	@echo "  replay_sim_day       MANUAL - restates a bill as version N+1 (R7)"
+	@echo "=================================================================="
+	@$(COMPOSE) exec -T airflow airflow dags list 2>/dev/null | head -12 || true
+	@echo ""
+	@echo "--- sim-day lifecycle ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT sim_date, status, sealed_at IS NOT NULL AS sealed, tariff_received_at IS NOT NULL AS has_tariff, report_generated_at IS NOT NULL AS reported FROM sim_day_state ORDER BY sim_date DESC LIMIT 8;"
+	@echo "--- recent audit rows ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT job_name, sim_date, records_in, records_out, status, left(notes, 60) AS notes FROM pipeline_run_audit ORDER BY started_at DESC LIMIT 8;"
+
+report:  ## PHASE 5 CHECKPOINT: show generated billing report files
+	@echo "=================================================================="
+	@echo "BILLING REPORT ARTIFACTS (section 7 step 4)"
+	@echo ""
+	@echo "PASS: at least one CSV and one HTML file per billed simulated day."
+	@echo "=================================================================="
+	@$(COMPOSE) exec -T airflow ls -la /data/reports 2>/dev/null \
+		|| echo "  (no reports yet - daily_billing_report has not succeeded)"
+	@echo ""
+	@echo "--- issued bills by version ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT sim_date, version, count(*) AS households, round(sum(final_bill),2) AS total_lkr, bool_and(is_current) AS is_current FROM household_billing_daily GROUP BY sim_date, version ORDER BY sim_date DESC, version DESC LIMIT 10;"
+
+restate:  ## PHASE 5 CHECKPOINT: trigger replay_sim_day (R7 restatement)
+	@echo "Triggering replay_sim_day for the most recently billed day..."
+	@$(COMPOSE) exec -T airflow airflow dags trigger replay_sim_day \
+		-c '{"reason":"make restate - demonstrating R7"}' 2>&1 | tail -3
+	@echo ""
+	@echo "Watch it in the UI, then run: make versions"
+
+versions:  ## PHASE 5 CHECKPOINT: prove R7 - version 2 supersedes version 1
+	@echo "=================================================================="
+	@echo "BILL RESTATEMENT (R7) - the payoff of the Kappa decision"
+	@echo ""
+	@echo "PASS criteria:"
+	@echo "  * more than one version exists for a restated day"
+	@echo "  * EXACTLY ONE version is is_current (enforced by a partial"
+	@echo "    unique index, so a breach fails loudly rather than silently)"
+	@echo "  * the superseded version is still readable - that is the audit"
+	@echo "    trail the whole architecture argument rests on"
+	@echo "=================================================================="
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT sim_date, version, count(*) AS households, round(sum(final_bill),2) AS total_lkr, bool_and(is_current) AS current FROM household_billing_daily GROUP BY sim_date, version ORDER BY sim_date DESC, version DESC;"
+	@echo "--- INVARIANT: exactly one current version per day (MUST be 0) ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT count(*) AS days_with_wrong_current_count FROM (SELECT sim_date, count(DISTINCT version) AS v FROM household_billing_daily WHERE is_current GROUP BY sim_date HAVING count(DISTINCT version) <> 1) bad;"
+	@echo "--- one household across versions (the before/after) ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT household_id, sim_date, version, tariff_rate, billing_tier, gross_cost, final_bill, is_current FROM household_billing_daily WHERE household_id = (SELECT household_id FROM household_billing_daily ORDER BY version DESC, final_bill DESC LIMIT 1) ORDER BY sim_date DESC, version;"
+
+observability:  ## Show all observability URLs (Phase 6)
+	@source .env \
+		&& echo "Grafana business:  http://localhost:$$GRAFANA_HOST_PORT/d/smartgrid-business" \
+		&& echo "Grafana platform:  http://localhost:$$GRAFANA_HOST_PORT/d/smartgrid-platform" \
+		&& echo "Prometheus:        http://localhost:$$PROMETHEUS_HOST_PORT" \
+		&& echo "  alert rules:     http://localhost:$$PROMETHEUS_HOST_PORT/alerts" \
+		&& echo "  scrape targets:  http://localhost:$$PROMETHEUS_HOST_PORT/targets" \
+		&& echo "Alertmanager:      http://localhost:$$ALERTMANAGER_HOST_PORT" \
+		&& echo "Airflow:           http://localhost:$$AIRFLOW_HOST_PORT" \
+		&& echo "API docs:          http://localhost:$$API_HOST_PORT/docs"
+
+metrics:  ## PHASE 6 CHECKPOINT: scrape targets and key metric values
+	@echo "=================================================================="
+	@echo "PROMETHEUS TARGETS (section 8)"
+	@echo ""
+	@echo "PASS: every target healthy. `up == 0` is the one signal that stays"
+	@echo "true when a process is too broken to export anything else."
+	@echo "=================================================================="
+	@source .env && curl -s \
+		"http://localhost:$$PROMETHEUS_HOST_PORT/api/v1/targets?state=active" \
+		| python -c "import json,sys; d=json.load(sys.stdin)['data']['activeTargets']; \
+		print('  %d up / %d total' % (len([t for t in d if t['health']=='up']), len(d))); \
+		[print('  %-22s %s' % (t['labels'].get('instance'), t['health'])) for t in d]"
+	@echo ""
+	@echo "--- key metric values ---"
+	@source .env && for q in \
+		'sum(rate(smartgrid_events_produced_total[2m]))' \
+		'sum(rate(smartgrid_events_consumed_total[2m]))' \
+		'sum(rate(smartgrid_serving_rows_upserted_total[5m]))' \
+		'max(smartgrid_billing_unpriced_households)' \
+		'smartgrid_daily_report_success_total'; do \
+		  v=$$(curl -s --get --data-urlencode "query=$$q" \
+		     "http://localhost:$$PROMETHEUS_HOST_PORT/api/v1/query" \
+		     | python -c "import json,sys; r=json.load(sys.stdin)['data']['result']; \
+		       print(r[0]['value'][1] if r else 'no data')"); \
+		  printf "  %-52s %s\n" "$$q" "$$v"; \
+		done
+
+alerts:  ## PHASE 6 CHECKPOINT: alert rules loaded and their state
+	@echo "=================================================================="
+	@echo "ALERT RULES (section 8 requires at least four; seven are defined)"
+	@echo ""
+	@echo "  inactive = condition false (healthy)"
+	@echo "  pending  = condition TRUE, waiting out its `for:` duration"
+	@echo "  firing   = alert sent to Alertmanager"
+	@echo ""
+	@echo "PASS: all seven present. LowRenewableContribution pending overnight"
+	@echo "in simulated time is CORRECT - the diurnal cycle, not a fault."
+	@echo "=================================================================="
+	@source .env && curl -s http://localhost:$$PROMETHEUS_HOST_PORT/api/v1/rules \
+		| python -c "import json,sys; g=json.load(sys.stdin)['data']['groups']; \
+		[print('  %-9s %-28s %s' % (r['state'], r['name'], \
+		  r['labels'].get('severity',''))) for x in g for r in x['rules']]"
+	@echo ""
+	@echo "--- currently firing in Alertmanager ---"
+	@source .env && curl -s http://localhost:$$ALERTMANAGER_HOST_PORT/api/v2/alerts \
+		| python -c "import json,sys; a=json.load(sys.stdin); \
+		print('  (none)') if not a else \
+		[print('  %s %s' % (x['labels'].get('alertname'), \
+		  x['labels'].get('grid_zone',''))) for x in a]" 2>/dev/null \
+		|| echo "  (alertmanager not reachable)"
 
 psql:  ## Open a psql shell on the serving database
 	@source .env && $(COMPOSE) exec postgres \

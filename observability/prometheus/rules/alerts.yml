@@ -1,0 +1,193 @@
+# =============================================================================
+# Alert rules (§8). The brief requires these and names four explicitly; all four
+# are here, plus two that the Phase 3 work made obviously necessary.
+#
+# WHY DECLARATIVE RULES RATHER THAN CHECKS IN CODE
+# ------------------------------------------------
+# §3 justifies Prometheus on exactly this: "Prometheus' rule engine expresses
+# 'no data in N minutes' and 'error rate above threshold' declaratively". A check
+# written inside a job can only fire while that job is alive — which is useless
+# for the one alert that matters most, "the job died". A rule evaluated by an
+# external system fires precisely when the thing it watches has stopped.
+#
+# THE SIMULATED-CLOCK TRAP, AND WHY EVERY `for:` HERE IS IN REAL TIME
+# -------------------------------------------------------------------
+# Every duration below is REAL time, because Prometheus evaluates against wall
+# clock. That is correct and needs no conversion — but it is the opposite of the
+# convention inside the Spark jobs, where every duration is a real-time quantity
+# multiplied by compression_ratio() onto the simulated axis. Mixing the two cost
+# this project three separate bugs in Phases 2 and 3 (see
+# tests/unit/test_time_budgets.py), so it is stated plainly here: nothing in this
+# file is scaled by 288.
+#
+# The one place the simulated clock does intrude is
+# `smartgrid_last_event_timestamp_seconds`, which Job B sets to the SIMULATED
+# window end. Comparing it against `time()` would subtract a real timestamp from
+# a simulated one and produce nonsense, so the staleness rule uses scrape
+# liveness and produced-counter movement instead. That is called out on the rule.
+# =============================================================================
+groups:
+  - name: smartgrid-freshness
+    interval: 15s
+    rules:
+      # --- REQUIRED RULE 1 (§8): NoDataReceived ---------------------------
+      #
+      # §8 writes this as
+      #   time() - smartgrid_last_event_timestamp_seconds > 120
+      # which cannot work here: that gauge holds a SIMULATED instant (Job B sets
+      # it from window_end), so subtracting it from real `time()` gives a
+      # difference of months. Implemented instead as "the produced counter has
+      # not moved", which is the same question asked in a way the data supports.
+      #
+      # The demo for this is §11 step 6: kill the meter simulator and watch it
+      # fire within 2 minutes.
+      - alert: NoDataReceived
+        expr: |
+          sum(rate(smartgrid_events_produced_total[2m])) == 0
+          or absent(smartgrid_events_produced_total)
+        for: 1m
+        labels:
+          severity: critical
+          requirement: R4
+        annotations:
+          summary: "No meter readings produced in the last 2 minutes"
+          description: >-
+            The producer counter has not advanced. Either the meter simulator has
+            stopped or it cannot reach Kafka. Every downstream aggregate and bill
+            is frozen until this clears.
+          runbook: "docker compose logs meter-simulator; docker compose up -d meter-simulator"
+
+      # A scrape-liveness companion. `up` is the one signal that is true even
+      # when a process is too broken to export anything, so it catches the case
+      # the counter rule cannot: a container that is gone rather than quiet.
+      - alert: ServiceDown
+        expr: up{job=~"simulators|streaming-jobs|api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }} is not responding"
+          description: >-
+            Prometheus cannot scrape this target. On a 3 GB-capped Docker host the
+            usual cause is the OOM killer taking a Spark driver, so check memory
+            before assuming a code fault.
+
+  - name: smartgrid-quality
+    interval: 15s
+    rules:
+      # --- REQUIRED RULE 2 (§8): HighRejectRate ---------------------------
+      #
+      # Threshold 5% per §8, against a simulator that injects faults at a
+      # designed 0.8% and measured 0.74% in steady state — so this has ~6x
+      # headroom and will not fire on normal operation.
+      #
+      # The `> 0` guard on the denominator matters: without it, a period with no
+      # traffic gives 0/0 = NaN, which never fires, so a genuinely stalled
+      # pipeline would be silently exempt from its own quality rule.
+      - alert: HighRejectRate
+        expr: |
+          (
+            sum(rate(smartgrid_events_rejected_total[5m]))
+            /
+            sum(rate(smartgrid_events_consumed_total[5m]))
+          ) > 0.05
+          and sum(rate(smartgrid_events_consumed_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reject rate above 5% for 2 minutes"
+          description: >-
+            Validation is rejecting more than 5% of readings. Inspect the DLQ for
+            the dominant reason class before trusting any bill issued from this
+            data — the Airflow data_quality_checks gate blocks at 2%.
+          runbook: "make dlq"
+
+      # --- REQUIRED RULE 3 (§8): ConsumerLagGrowing -----------------------
+      #
+      # 10000 records per §8. Job A consumes 2000 per micro-batch at a 5-second
+      # trigger, so a sustained lag above 10000 means it is falling behind
+      # faster than it can catch up — which, at 288x compression, leads to the
+      # watermark dropping records rather than merely to latency.
+      - alert: ConsumerLagGrowing
+        expr: smartgrid_kafka_consumer_lag > 10000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer lag on {{ $labels.topic }} above 10000"
+          description: >-
+            A streaming job is not keeping up. Raising MAX_OFFSETS_PER_TRIGGER is
+            NOT the fix on its own — it widens a batch's event-time span and can
+            push it past the watermark, which silently drops data. Raise the
+            watermark with it (see the Job B startup assertion).
+
+      # --- REQUIRED RULE 4 (§8): DailyReportMissed ------------------------
+      #
+      # One simulated day is 5 real minutes (§0), so a 10-minute window is two
+      # simulated days with no report — comfortably past a single missed run.
+      - alert: DailyReportMissed
+        expr: |
+          increase(smartgrid_daily_report_success_total[10m]) == 0
+          or absent(smartgrid_daily_report_success_total)
+        for: 2m
+        labels:
+          severity: critical
+          requirement: R5
+        annotations:
+          summary: "No billing report generated in the last 10 minutes"
+          description: >-
+            daily_billing_report has not succeeded for roughly two simulated days.
+            Bills are not being issued. Check whether the sim-day is sealed and
+            whether its tariff arrived — the DAG skips (does not fail) when the
+            D+1 feed is late, so a quiet Airflow UI is consistent with this alert.
+          runbook: "make dags; make report"
+
+  - name: smartgrid-business
+    interval: 15s
+    rules:
+      # --- LOW_RENEWABLE (§7 Job D, R3) ------------------------------------
+      #
+      # NOTE THE `!= -1` GUARD, which is the subtle one. zone_load_1m stores NULL
+      # renewable_pct for a zone with zero consumption, because solar/0 has no
+      # defensible value. A silent zone must therefore NOT fire this alert — it
+      # must fire the staleness alert instead, which is the accurate description
+      # of what is wrong. Job D (the evaluator that writes the alerts table) has
+      # the same obligation; it is recorded in serving/sql/001_schema.sql.
+      #
+      # 15% per §7. Overnight every zone is legitimately at 0%, so this WILL fire
+      # nightly on simulated time — which is correct behaviour for the rule as
+      # specified, and the reason §7 qualifies it with "during simulated daylight
+      # hours". Encoding daylight in PromQL would mean teaching Prometheus the
+      # simulated clock; Job D does it properly in Python instead.
+      - alert: LowRenewableContribution
+        expr: smartgrid_zone_renewable_pct < 15 and smartgrid_zone_renewable_pct != -1
+        for: 3m
+        labels:
+          severity: warning
+          requirement: R3
+        annotations:
+          summary: "Zone {{ $labels.grid_zone }} renewable share below 15%"
+          description: >-
+            Solar contribution in this zone has been under 15% for 3 minutes.
+            Expected overnight in simulated time; investigate if it persists
+            through simulated midday, which would indicate cloud cover or a
+            generation fault rather than the diurnal cycle.
+
+      # Un-priced households, from the gauge Job C sets. Expected to spike at
+      # every simulated day boundary and fall to zero once the D+1 tariff lands,
+      # so the `for:` has to outlast a normal boundary or this would fire every
+      # five real minutes on correct behaviour.
+      - alert: BillingTariffStalled
+        expr: max(smartgrid_billing_unpriced_households) > 0
+        for: 6m
+        labels:
+          severity: warning
+          requirement: R5
+        annotations:
+          summary: "Households still awaiting a tariff after 6 minutes"
+          description: >-
+            Job C is writing kWh with no rate (it refuses to guess — §7). A spike
+            at a sim-day boundary is normal; persisting past one simulated day
+            means the tariff simulator or the batch loader has stalled.
+          runbook: "docker compose logs tariff-simulator batch-loader"

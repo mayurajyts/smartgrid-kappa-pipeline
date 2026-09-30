@@ -32,3 +32,20 @@ datasources:
       timescaledb: false
     isDefault: true
     editable: true
+
+  # ---------------------------------------------------------------------------
+  # Prometheus, for the PLATFORM dashboard (Phase 6). The business dashboard
+  # reads Postgres (SQL aggregations over serving tables); the platform one reads
+  # Prometheus (rates and histogram quantiles over counters). Two datasources
+  # because they answer different questions, not because of duplication.
+  # ---------------------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    uid: smartgrid-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 10s

@@ -145,6 +145,13 @@ TARGET_COLUMNS = (
     "self_consumption_ratio",
     "running_cost",
     "tariff_missing",
+    # Persisted so the issued bill (Phase 5) can be priced against the tariff
+    # that was authoritative for the day, rather than inferring a tier from
+    # consumption. The feed assigns tier from base_load_kw, not daily draw, so
+    # inference would disagree with the feed for most households.
+    "tariff_rate",
+    "billing_tier",
+    "subsidy_flag",
     "updated_at",
 )
 CONFLICT_COLUMNS = ("household_id", "sim_date")
@@ -383,6 +390,11 @@ class JobC:
             .alias("self_consumption_ratio"),
             F.col("_bill.running_cost").alias("running_cost"),
             F.col("_bill.tariff_missing").alias("tariff_missing"),
+            # Carried through from the joined dimension, NULL when no tariff had
+            # arrived -- which is the same condition tariff_missing reports.
+            F.col("tariff_rate").cast(T.DecimalType(10, 4)).alias("tariff_rate"),
+            F.col("billing_tier"),
+            F.col("subsidy_flag"),
             F.current_timestamp().alias("updated_at"),
         )
 

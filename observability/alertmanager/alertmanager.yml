@@ -1,0 +1,73 @@
+# =============================================================================
+# Alertmanager configuration (§8, Phase 6).
+#
+# WHY A NULL RECEIVER RATHER THAN EMAIL OR SLACK
+# ----------------------------------------------
+# Every alert routes to a receiver that does nothing. That is deliberate and
+# should be said out loud rather than looking like an oversight:
+#
+#   * The assessed deliverable is that alert RULES exist and fire correctly
+#     (§8, and §11 step 6 demos it). Firing is visible in the Alertmanager UI,
+#     which is what the demo shows.
+#   * A real receiver needs a credential — an SMTP password or a Slack webhook.
+#     Committing one would be a security fault; requiring the marker to supply
+#     one would break `make up` from a clean clone (§13).
+#
+# Production would route by severity to an on-call rotation; that is noted in the
+# report's production-scale section alongside the other concessions.
+#
+# GROUPING IS THE PART THAT IS NOT A STUB
+# ---------------------------------------
+# The grouping and inhibition below are real and worth defending. Without them,
+# one failure produces a storm: killing the meter simulator would fire
+# NoDataReceived, ServiceDown, five LowRenewableContribution alerts (every zone
+# goes quiet) and eventually DailyReportMissed — nine notifications describing
+# one event. The inhibition rules collapse that to the root cause.
+# =============================================================================
+global:
+  resolve_timeout: 2m
+
+route:
+  receiver: default
+  # Group by the alert and the entity it is about, so five zones going quiet are
+  # five rows in one notification rather than five notifications.
+  group_by: [alertname, grid_zone]
+  # Short waits: one simulated day is 5 real minutes (§0), so a 5-minute
+  # group_interval would be a whole simulated day of silence.
+  group_wait: 15s
+  group_interval: 1m
+  repeat_interval: 1h
+
+  routes:
+    # Critical alerts bypass the grouping delay — NoDataReceived means the
+    # pipeline has stopped, and there is nothing to batch it with.
+    - matchers: [severity="critical"]
+      receiver: critical
+      group_wait: 5s
+      repeat_interval: 15m
+
+receivers:
+  - name: default
+  - name: critical
+
+inhibit_rules:
+  # A dead service explains its own silence. Without this, killing a simulator
+  # fires both ServiceDown and NoDataReceived, and the second is a consequence
+  # rather than an independent problem.
+  - source_matchers: [alertname="ServiceDown", severity="critical"]
+    target_matchers: [alertname="NoDataReceived"]
+    equal: [platform]
+
+  # If no data is arriving at all, every zone's renewable share is meaningless —
+  # a zone reporting 0% because it is silent is a staleness problem, not a
+  # generation problem. This is the alert-routing counterpart of the NULL
+  # renewable_pct rule in serving/sql/001_schema.sql.
+  - source_matchers: [alertname="NoDataReceived"]
+    target_matchers: [alertname="LowRenewableContribution"]
+    equal: [platform]
+
+  # Bills cannot be issued if no data is arriving, so suppress the billing
+  # alerts rather than reporting a symptom of the outage as its own fault.
+  - source_matchers: [alertname="NoDataReceived"]
+    target_matchers: [alertname=~"DailyReportMissed|BillingTariffStalled"]
+    equal: [platform]

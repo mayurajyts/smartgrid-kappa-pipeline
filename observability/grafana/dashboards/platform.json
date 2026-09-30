@@ -1,0 +1,722 @@
+{
+  "uid": "smartgrid-platform",
+  "title": "Smart Grid - Platform",
+  "description": "Platform view (\u00a78): throughput, reject rate, micro-batch and upsert latency, consumer lag and freshness. Prometheus datasource. All durations here are REAL time -- unlike inside the Spark jobs, where every duration is scaled onto the simulated axis.",
+  "tags": [
+    "smartgrid",
+    "platform"
+  ],
+  "timezone": "utc",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Targets up",
+      "description": "Scrape targets responding. `up` is the only signal that stays true when a process is too broken to export anything else, so it catches a container the OOM killer took -- the usual failure on a 3 GB-capped host.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d13913",
+                "value": null
+              },
+              {
+                "color": "#1f8c4d",
+                "value": 6
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(up{job=~\"simulators|streaming-jobs|api\"})",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Readings produced /s",
+      "description": "Producer throughput. Expected ~100/s (200 meters every 2 real seconds). Zero here is what NoDataReceived fires on.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 4,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d13913",
+                "value": null
+              },
+              {
+                "color": "#1f8c4d",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(smartgrid_events_produced_total[2m]))",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Reject rate",
+      "description": "Designed 0.8%, measured 0.74% in Phase 2. The Airflow quality gate blocks a bill at 2% and HighRejectRate warns at 5%. clamp_min guards 0/0, which would otherwise read NaN and exempt a stalled pipeline from its own rule.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 9,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#1f8c4d",
+                "value": null
+              },
+              {
+                "color": "#c98500",
+                "value": 2
+              },
+              {
+                "color": "#d13913",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "100 * sum(rate(smartgrid_events_rejected_total[5m]))\n  / clamp_min(sum(rate(smartgrid_events_consumed_total[5m])), 0.001)",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Rows upserted /s",
+      "description": "Serving-store WRITE rate. The counterpart of the consumed counter: jobs consuming steadily while this stays flat is the signature of a silently failing upsert, which no consumed-side metric can distinguish from a quiet stream.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 14,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2,
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d13913",
+                "value": null
+              },
+              {
+                "color": "#1f8c4d",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(smartgrid_serving_rows_upserted_total[5m]))",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Awaiting tariff",
+      "description": "Households Job C wrote with kWh but no rate (it refuses to guess -- \u00a77). A spike at every sim-day boundary falling to zero is CORRECT; a gauge rather than a counter precisely so the fall is visible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 19,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#1f8c4d",
+                "value": null
+              },
+              {
+                "color": "#c98500",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max(smartgrid_billing_unpriced_households)",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput by stage",
+      "description": "The pipeline end to end. Produced should track consumed; a widening gap is lag. Upserted is far lower by design -- Job B writes ~5 aggregate rows per real minute from ~6000 readings, which is the aggregation doing its job.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "axisBorderShow": false,
+            "gradientMode": "none"
+          },
+          "unit": "reqps",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(smartgrid_events_produced_total[1m]))",
+          "legendFormat": "produced",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(smartgrid_events_consumed_total[1m]))",
+          "legendFormat": "consumed",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(smartgrid_serving_rows_upserted_total[1m]))",
+          "legendFormat": "upserted",
+          "range": true,
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejections by reason",
+      "description": "Broken out by DLQ reason class. All four validation classes should be present in steady state; one class dominating means a specific fault type has changed rate, and one class VANISHING can mean a threshold has been widened past the injected fault (which happened in Phase 5 -- see the future-tolerance coupling note in job_a_clean_enrich.py).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "axisBorderShow": false,
+            "gradientMode": "none",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "reqps",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(smartgrid_events_rejected_total[2m]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Micro-batch duration (p95)",
+      "description": "p95 per job. The 5-second trigger is the budget: a p95 above it means the job cannot keep up and lag will grow. \u00a72.4 allows under 10 s end to end.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "axisBorderShow": false,
+            "gradientMode": "none"
+          },
+          "unit": "s",
+          "decimals": 3,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (job, le) (rate(smartgrid_batch_micro_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{job}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Serving upsert duration (p95)",
+      "description": "The staging-write plus MERGE transaction, separated from the micro-batch figure on purpose: a batch slowed by Postgres and one slowed by Spark need different fixes, and the combined number hides which it is.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "axisBorderShow": false,
+            "gradientMode": "none"
+          },
+          "unit": "s",
+          "decimals": 3,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (job, table, le) (rate(smartgrid_serving_upsert_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{job}} {{table}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka consumer lag",
+      "description": "ConsumerLagGrowing warns above 10000 for 3 minutes. Raising MAX_OFFSETS_PER_TRIGGER is NOT the fix on its own: it widens a batch's event-time span and can push it past the watermark, which silently drops data rather than merely delaying it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 21
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "axisBorderShow": false,
+            "gradientMode": "none"
+          },
+          "unit": "short",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "smartgrid_kafka_consumer_lag",
+          "legendFormat": "{{topic}} / {{group}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Renewable share per zone",
+      "description": "The same figure the business dashboard plots, here as the signal LowRenewableContribution evaluates. Overnight zeros are the diurnal cycle, not a fault -- which is why \u00a77 qualifies that rule with 'during simulated daylight hours' and why Job D, not PromQL, decides what daylight means.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "smartgrid-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 21
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "axisBorderShow": false,
+            "gradientMode": "none"
+          },
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "smartgrid-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "smartgrid_zone_renewable_pct",
+          "legendFormat": "{{grid_zone}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": []
+  }
+}

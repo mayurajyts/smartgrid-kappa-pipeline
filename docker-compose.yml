@@ -797,7 +797,173 @@ services:
     restart: unless-stopped
 
 
+  # ===========================================================================
+  # PHASE 5 - orchestration (section 7, section 10)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Airflow, running scheduler + webserver + API server in ONE container via
+  # `airflow standalone`.
+  #
+  # WHY ONE CONTAINER AND NOT THE SEPARATE WEBSERVER/SCHEDULER OF section 4.2:
+  # this host caps Docker at 3 GB (see the .wslconfig note) and already runs
+  # eleven containers including three Spark drivers and a worker. The separate
+  # topology costs roughly twice the memory, which in practice would mean
+  # stopping job-b and job-c to run Airflow -- so the demo could not show the
+  # stream and the orchestration alive at the same time, which is the one thing
+  # the demo most needs to show.
+  #
+  # TRADE-OFF, stated in the report alongside the single Kafka broker: this is
+  # not a production topology. There is no separate scheduler to fail over, no
+  # worker pool, and LocalExecutor runs tasks as subprocesses of the scheduler.
+  # Production would use CeleryExecutor or KubernetesExecutor with independent
+  # scheduler and worker deployments.
+  #
+  # The METADATA database is the `airflow` Postgres database that
+  # docker/postgres/init/01_create_databases.sh already creates -- not SQLite.
+  # SQLite would force SequentialExecutor, which cannot run two tasks at once
+  # and would make the DAG dependencies in this phase meaningless.
+  # ---------------------------------------------------------------------------
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: smartgrid-airflow:latest
+    container_name: smartgrid-airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+        postgresql+psycopg2://${AIRFLOW_POSTGRES_USER}:${AIRFLOW_POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${AIRFLOW_POSTGRES_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/project/orchestration/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+      # One task at a time. The tasks are small, and on a memory-capped host a
+      # burst of parallel tasks is the thing most likely to wedge Docker.
+      AIRFLOW__CORE__PARALLELISM: "2"
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+      # The DAG files are scanned often; 30s keeps a code change visible in the
+      # UI quickly without the scheduler re-parsing constantly.
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+      # No authentication, consistent with the API and Kafka (assumption section 14).
+      # Production requirements are noted in the report.
+      AIRFLOW__WEBSERVER__AUTHENTICATE: "False"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.default
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      # The serving store the DAGs read and write. Same variables every other
+      # service uses, so the DAGs need no Airflow Connection configured through
+      # the UI -- which would be state outside this repository and would break
+      # reproducibility from a clean clone (section 13).
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # The simulated clock. The DAGs derive their target sim_date from this,
+      # NOT from Airflow's logical_date - Airflow schedules on real time and the
+      # business day here is simulated, running 288x faster.
+      SIM_START_DATE: ${SIM_START_DATE}
+      SIM_ANCHOR_REAL: ${SIM_ANCHOR_REAL}
+      SIM_DAY_REAL_SECONDS: ${SIM_DAY_REAL_SECONDS}
+      REPORT_DIR: ${REPORT_DIR}
+      DQ_MAX_REJECT_RATE_PCT: ${DQ_MAX_REJECT_RATE_PCT}
+      DQ_MIN_METER_COVERAGE_PCT: ${DQ_MIN_METER_COVERAGE_PCT}
+      DQ_EXPECTED_HOUSEHOLDS: ${DQ_EXPECTED_HOUSEHOLDS}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT}
+      BILLING_BLOCK_KWH: ${BILLING_BLOCK_KWH}
+      BILLING_TIER_1_RATE: ${BILLING_TIER_1_RATE}
+      BILLING_TIER_2_RATE: ${BILLING_TIER_2_RATE}
+      BILLING_TIER_3_RATE: ${BILLING_TIER_3_RATE}
+      BILLING_TIER_4_RATE: ${BILLING_TIER_4_RATE}
+      BILLING_EXPORT_CREDIT_FRACTION: ${BILLING_EXPORT_CREDIT_FRACTION}
+      BILLING_SUBSIDY_DISCOUNT_PCT: ${BILLING_SUBSIDY_DISCOUNT_PCT}
+    volumes:
+      # The repository, read-only. Bind-mounted rather than copied so the DAGs
+      # call the SAME processing/transforms/billing.py the Spark job does -- the
+      # single-implementation claim is structural, not a promise.
+      - ./common:/opt/project/common:ro
+      - ./processing:/opt/project/processing:ro
+      - ./orchestration:/opt/project/orchestration:ro
+      - ./simulators:/opt/project/simulators:ro
+      - ./.env:/opt/project/.env:ro
+      # Report artifacts. A named volume so they survive a restart, which the
+      # Phase 5 checkpoint ("a full sim-day produces a report file") needs.
+      - report-data:/data/reports
+    ports:
+      - "${AIRFLOW_HOST_PORT}:8080"
+    command: ["bash", "-c", "airflow db migrate && exec airflow standalone"]
+    restart: unless-stopped
+
+
+  # ===========================================================================
+  # PHASE 6 - observability (section 8, a first-class deliverable worth 10 marks)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Prometheus. PULLS /metrics from every service rather than receiving pushes -
+  # see the long note in observability/prometheus/prometheus.yml for why pull
+  # beats a Pushgateway here (a pushed metric outlives its dead source, so "the
+  # simulator stopped" would look identical to "the simulator is fine").
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: smartgrid-prometheus
+    depends_on:
+      alertmanager:
+        condition: service_started
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 24h is ample: the alert rules look back at most 10 minutes, and a long
+      # retention on a 3 GB-capped host competes with Spark for memory.
+      - --storage.tsdb.retention.time=24h
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_HOST_PORT}:9090"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Alertmanager. Every alert routes to a receiver that does nothing, on purpose:
+  # the assessed deliverable is that the RULES fire correctly (visible in this
+  # UI, which is what section 11 step 6 demonstrates), and a real receiver would
+  # need an SMTP password or a Slack webhook - committing one is a security
+  # fault, requiring one breaks `make up` from a clean clone.
+  #
+  # The grouping and inhibition rules are NOT stubs and are worth defending: one
+  # failure otherwise produces nine notifications describing one event.
+  # ---------------------------------------------------------------------------
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: smartgrid-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "${ALERTMANAGER_HOST_PORT}:9093"
+    restart: unless-stopped
+
+
 volumes:
+  # Prometheus TSDB and Alertmanager's notification state. Named volumes so
+  # a restart does not lose the series the alert rules evaluate over.
+  prometheus-data:
+  alertmanager-data:
+  # Rendered billing reports (CSV + HTML) from daily_billing_report.
+  # A named volume so a report survives a container restart, which the
+  # Phase 5 checkpoint depends on.
+  report-data:
   # Grafana's own state (its SQLite db). The dashboards themselves are
   # provisioned from files, so nothing here is a deliverable -- this only
   # stops Grafana re-initialising on every restart.
