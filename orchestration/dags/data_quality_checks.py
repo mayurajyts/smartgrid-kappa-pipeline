@@ -186,7 +186,7 @@ def data_quality_checks():
             SELECT sum(records_in) AS records_in,
                    sum(records_rejected) AS rejected
             FROM pipeline_run_audit
-            WHERE job_name LIKE 'job_a%' AND started_at > now() - interval '1 hour'
+            WHERE job_name LIKE 'job_a%%' AND started_at > now() - interval '1 hour'
             """
         ) or {}
 
