@@ -20,5 +20,8 @@ Makefile    text eol=lf
 *.yaml      text eol=lf
 *.py        text eol=lf
 *.json      text eol=lf
+# .sql is piped into psql inside the postgres container by `make serving-schema`
+# and read by the init hook; same CRLF hazard as the shell scripts.
+*.sql       text eol=lf
 *.csv       text eol=lf
 .env.example text eol=lf

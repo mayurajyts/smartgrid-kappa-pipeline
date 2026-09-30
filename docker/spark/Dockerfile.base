@@ -46,6 +46,13 @@
 # demo. Versions are pinned to match: spark-sql-kafka 3.5.3 for Spark 3.5.3, and
 # hadoop-aws 3.3.4 against the hadoop-client 3.3.4 already in the image. A
 # mismatched hadoop-aws is the usual cause of NoSuchMethodError on the s3a path.
+#
+# CHANGING ANYTHING IN THIS FILE NEEDS A FORCED REBUILD.
+# `make spark-base` is gated on `docker image inspect` -- it skips the build
+# entirely when the image already exists, which is what makes the fast inner
+# loop fast. The consequence is that editing a JAR version or a pip dependency
+# here has NO effect until the image is deleted. `make rebuild` does not help:
+# it rebuilds only the thin code layer on top. Use `make spark-base-force`.
 # =============================================================================
 FROM apache/spark:3.5.3-python3
 
@@ -88,6 +95,7 @@ ARG SPARK_VERSION=3.5.3
 ARG SCALA_VERSION=2.12
 ARG HADOOP_VERSION=3.3.4
 ARG AWS_SDK_VERSION=1.12.262
+ARG POSTGRES_JDBC_VERSION=42.7.4
 
 RUN set -eux; \
     MAVEN=https://repo1.maven.org/maven2; \
@@ -107,4 +115,15 @@ RUN set -eux; \
     curl -fsSL -o "$JARS/hadoop-aws-${HADOOP_VERSION}.jar" \
         "$MAVEN/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar"; \
     curl -fsSL -o "$JARS/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar" \
-        "$MAVEN/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"
+        "$MAVEN/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"; \
+    # Postgres JDBC driver (Phase 3). Jobs B and C write their aggregates to the
+    # serving store, and without this the failure is
+    #   java.sql.SQLException: No suitable driver found for jdbc:postgresql://...
+    # which reads like a connection-string bug rather than a missing dependency.
+    #
+    # A JVM driver rather than psycopg2 on purpose: the write stays distributed
+    # across executors instead of being collected to the driver, and the upsert's
+    # MERGE runs through the same JVM connection the DataFrame writer already
+    # uses. See processing/sinks/postgres_sink.py.
+    curl -fsSL -o "$JARS/postgresql-${POSTGRES_JDBC_VERSION}.jar" \
+        "$MAVEN/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar"

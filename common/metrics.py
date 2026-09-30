@@ -146,6 +146,58 @@ sim_day_current = Gauge(
 )
 
 
+# ---------------------------------------------------------------------------
+# Serving-store writes (Phase 3). Jobs B and C are the first jobs whose output
+# leaves Kafka, so they are the first that can fail on the WRITE side.
+# ---------------------------------------------------------------------------
+
+# Rows merged into a serving table per micro-batch -- the write-side counterpart
+# of events_consumed_total.
+#
+# WHY IT IS WORTH A SEPARATE METRIC: a job consuming steadily while this stays
+# flat is the exact signature of an upsert that is failing or writing nothing,
+# and no consumed-side metric can distinguish that from a quiet stream. Without
+# it, "the dashboard is empty" has two causes that look identical from the
+# outside.
+serving_rows_upserted_total = Counter(
+    "smartgrid_serving_rows_upserted_total",
+    "Rows merged into a Postgres serving table by a streaming sink.",
+    ["job", "table"],
+    registry=REGISTRY,
+)
+
+# Duration of one staging-write plus MERGE transaction.
+#
+# Deliberately NOT folded into batch_micro_duration_seconds: a micro-batch that
+# has become slow because of Postgres and one that has become slow because of
+# Spark need entirely different fixes, and the combined figure hides which it is.
+# Separating them is what makes the platform dashboard diagnostic rather than
+# merely descriptive (§8).
+serving_upsert_duration_seconds = Histogram(
+    "smartgrid_serving_upsert_duration_seconds",
+    "Wall-clock duration of one staging write plus MERGE transaction.",
+    ["job", "table"],
+    buckets=_LATENCY_BUCKETS,
+    registry=REGISTRY,
+)
+
+# Households with running kWh but no tariff for the simulated day (§7's explicit
+# availability-vs-correctness choice: write the kWh, never guess a rate).
+#
+# A GAUGE, NOT A COUNTER, and the distinction is the whole value of the metric.
+# The question being asked is "how many households are un-priced RIGHT NOW", and
+# the expected trajectory is a spike at every simulated day boundary that falls
+# back to zero once the D+1 tariff feed lands (§14). A counter could only ever
+# rise, so it could show the spike but never the recovery -- which is the half
+# that says the pipeline is healthy.
+billing_unpriced_households = Gauge(
+    "smartgrid_billing_unpriced_households",
+    "Households with running consumption but no tariff for the sim_date.",
+    ["sim_date"],
+    registry=REGISTRY,
+)
+
+
 def start_metrics_server(port: int | None = None) -> int:
     """Expose /metrics for Prometheus to scrape, returning the bound port.
 

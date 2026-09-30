@@ -109,6 +109,89 @@ class MeterReading(_Contract):
     schema_version: int = SCHEMA_VERSION
 
 
+class MeterReadingClean(_Contract):
+    """A validated, deduplicated, enriched reading — `meter.readings.clean.v1`.
+
+    WHY THIS CONTRACT EXISTS SEPARATELY FROM `MeterReading`
+    ------------------------------------------------------
+    §6 names four topics and gives a contract for three of them; the clean topic
+    is described only as Job A's output (§7 Job A step 5). That omission was
+    survivable while Job A was the only job that knew its shape, because the
+    shape lived in one `F.struct(...)` in one file.
+
+    It stops being survivable in Phase 3. Jobs B and C both PARSE this topic, and
+    neither may use `inferSchema` on a stream (see the module docstring). Without
+    a shared definition each would have to mirror Job A's field list by hand, and
+    three hand-maintained copies of one contract is the exact failure this module
+    was created to prevent: a field added in Job A's writer and not in Job B's
+    reader arrives as a silent null, and the first symptom is a wrong aggregate.
+
+    So this is the single definition. Job A's writer selects against
+    `CLEAN_READING_FIELDS`, and Jobs B and C parse with
+    `clean_reading_spark_schema()`, which means producer and consumers cannot
+    drift without the diff showing it here.
+
+    WHAT IS AND IS NOT ON THIS CONTRACT
+    -----------------------------------
+    The derived columns (`net_grid_kwh`, `self_consumption_kwh`, `is_exporting`,
+    `time_of_day_bucket`) and the dimension columns (`has_solar`,
+    `solar_capacity_kw`, `zone_name`, `zone_capacity_kw`) are carried on the wire
+    rather than recomputed downstream. That is deliberate: they are computed once,
+    by the job that owns the enrichment logic, so Jobs B and C cannot derive them
+    differently. A stream-static join per consumer would be the alternative, and
+    it would reintroduce the dual-logic bug class that §2.2d rejects Lambda over.
+
+    `raw_payload`, `kafka_partition` and `kafka_offset` are deliberately ABSENT.
+    They are routing and diagnosis devices internal to Job A (the DLQ keeps the
+    raw bytes, and the synthetic dedupe key uses the Kafka coordinates). Offsets
+    in particular must not cross this boundary: they change on replay, so a
+    downstream job that keyed anything on them would produce different results on
+    a reprocessing run and contradict the Kappa argument outright.
+
+    `schema_version` is also absent, matching what Job A has published since
+    Phase 2. Adding it now would change the payload of a topic that already has
+    records on it, so it waits for a `.v2` topic — which is what the version
+    integer exists to make possible.
+    """
+
+    event_id: str
+    meter_id: str
+    household_id: str
+    grid_zone: str
+
+    power_consumption_kwh: float = Field(ge=0)
+    solar_generation_kwh: float = Field(ge=0)
+
+    # Signed, and NOT clamped: negative means the household exported to the grid
+    # in this interval. Billing depends on the sign (see transforms/billing.py),
+    # so clamping here would silently delete every export credit.
+    net_grid_kwh: float
+    self_consumption_kwh: float = Field(ge=0)
+    is_exporting: bool
+
+    has_solar: bool
+    solar_capacity_kw: float = Field(ge=0)
+    zone_name: str
+    zone_capacity_kw: float = Field(gt=0)
+    time_of_day_bucket: str
+
+    event_timestamp: datetime
+    sim_date: date
+    producer_emitted_at: datetime
+    correlation_id: str
+
+
+# The wire field order of `meter.readings.clean.v1`, in one place.
+#
+# Job A's writer selects against this tuple and the Spark schema below is built
+# from it, so the producer's payload and the consumers' parse cannot disagree
+# about which fields exist or what order they are in. Editing one without the
+# other is impossible by construction rather than by review.
+CLEAN_READING_FIELDS: tuple[str, ...] = tuple(
+    MeterReadingClean.model_fields.keys()
+)
+
+
 class TariffReference(_Contract):
     """Daily billing reference — `tariff.reference.v1`, LOG-COMPACTED (§6.2).
 
@@ -224,6 +307,50 @@ def meter_reading_spark_schema() -> Any:
             T.StructField("producer_emitted_at", T.StringType(), True),
             T.StructField("correlation_id", T.StringType(), True),
             T.StructField("schema_version", T.IntegerType(), True),
+        ]
+    )
+
+
+def clean_reading_spark_schema() -> Any:
+    """Explicit StructType for `meter.readings.clean.v1` (Jobs B and C).
+
+    Field-for-field identical to `MeterReadingClean`, and ordered by
+    `CLEAN_READING_FIELDS` so the two cannot drift.
+
+    Every field is nullable at the parse layer, for the same reason
+    `meter_reading_spark_schema` gives — but the expectation here is different
+    and worth stating. Job A only publishes to this topic AFTER validation has
+    rejected null required fields into the DLQ, so a null on the clean topic is
+    not a data-quality event, it is evidence of a bug in Job A. Jobs B and C
+    therefore count such rows explicitly rather than letting them vanish inside a
+    stateful operator, which is the silent-loss failure Phase 2 was bitten by
+    twice.
+
+    Timestamps are strings here and cast explicitly downstream, for the same
+    session-configuration determinism reason as every other schema in this file.
+    """
+    T = _spark_types()
+    double_fields = {
+        "power_consumption_kwh",
+        "solar_generation_kwh",
+        "net_grid_kwh",
+        "self_consumption_kwh",
+        "solar_capacity_kw",
+        "zone_capacity_kw",
+    }
+    boolean_fields = {"is_exporting", "has_solar"}
+
+    def _type_for(name: str) -> Any:
+        if name in double_fields:
+            return T.DoubleType()
+        if name in boolean_fields:
+            return T.BooleanType()
+        return T.StringType()
+
+    return T.StructType(
+        [
+            T.StructField(name, _type_for(name), True)
+            for name in CLEAN_READING_FIELDS
         ]
     )
 

@@ -79,7 +79,11 @@ from common.metrics import (
     events_rejected_total,
     start_metrics_server,
 )
-from common.schemas import SCHEMA_VERSION, meter_reading_spark_schema
+from common.schemas import (
+    CLEAN_READING_FIELDS,
+    SCHEMA_VERSION,
+    meter_reading_spark_schema,
+)
 from common.sim_clock import compression_ratio, startup_banner
 from processing.spark_session import (
     build_spark_session,
@@ -128,7 +132,52 @@ class JobASettings(BaseSettings):
     # How far ahead of simulated now an event_timestamp may be before rejection.
     # Non-zero because micro-batch boundaries and the producer's tick mean a reading
     # can legitimately be stamped slightly ahead of when the driver evaluates it.
-    future_timestamp_tolerance_minutes: int = Field(default=5, gt=0)
+    #
+    # EXPRESSED IN REAL MINUTES, for exactly the same reason as the dedupe
+    # watermark above — and this one was missed in Phase 2, with worse consequences.
+    #
+    # The rule compares `event_timestamp` against `sim_now`, both on the SIMULATED
+    # axis. A tolerance stated in simulated minutes therefore shrinks as the
+    # compression ratio rises: 5 simulated minutes is 1.04 real seconds at 288x and
+    # only 0.21 REAL SECONDS at the 1440x of `make fast`. But the skew it has to
+    # absorb is a REAL-time quantity — Kafka transit plus however long the driver
+    # takes to evaluate the batch, which was measured at ~18 real seconds on this
+    # host. So every reading arrived looking hours "in the future" and 100% of them
+    # were rejected as `timestamp_in_future`, freezing the clean topic completely.
+    #
+    # Symptom, for the record: Job A committing batches steadily with zero lag,
+    # emitting nothing, and the DLQ filling with one reason class. The pipeline
+    # looked healthy from every angle except its output.
+    #
+    # Converted by compression_ratio() below, so the setting now means what it says
+    # at any clock speed. The default is deliberately larger than one micro-batch's
+    # real duration, with margin for a loaded host.
+    #
+    # THIS VALUE IS BOUNDED ON BOTH SIDES, which is why it is small and why the
+    # bound is written down rather than left to be rediscovered:
+    #
+    #   LOWER BOUND (real time): it must exceed the real skew between the producer
+    #   stamping a reading and the driver evaluating `sim_now` for the batch that
+    #   contains it — Kafka transit plus micro-batch duration.
+    #
+    #   UPPER BOUND (simulated time): it must stay BELOW the injected
+    #   future-timestamp fault, which `simulators/fault_injection.py` back-dates by
+    #   FAULT_FUTURE_TIMESTAMP_SIM_MINUTES = 30 SIMULATED minutes. Exceed it and that
+    #   fault stops being detected, the DLQ loses a whole reason class, and the
+    #   Phase 2 checkpoint ("all four DLQ reason classes present") silently fails.
+    #
+    # The two bounds are on DIFFERENT AXES, so the window between them narrows as the
+    # compression ratio rises. At 0.02 real minutes:
+    #
+    #   288x  (make demo-config): 1.2 real seconds of skew,  5.8 sim-min  < 30  OK
+    #   1440x (make fast):        1.2 real seconds of skew, 28.8 sim-min  < 30  OK
+    #
+    # 0.02 is the largest tested value that stays under the fault at BOTH speeds.
+    # Raising it past ~0.02 breaks fault detection at 1440x; lowering it re-opens the
+    # outage described above. If a slow host needs more real-time headroom, the
+    # correct fix is to raise FAULT_FUTURE_TIMESTAMP_SIM_MINUTES first, so the
+    # upper bound moves before the lower one is pushed against.
+    future_timestamp_tolerance_real_minutes: float = Field(default=0.02, gt=0)
 
     # 5s matches the <10s end-to-end budget in §2.4 with room for the sink writes.
     trigger_interval_seconds: int = Field(default=5, gt=0)
@@ -190,6 +239,15 @@ class JobA:
             self.settings.dedupe_watermark_real_minutes * compression_ratio()
         )
         self.dedupe_watermark = f"{self.dedupe_watermark_sim_minutes:.0f} minutes"
+
+        # Same real -> simulated conversion for the future-timestamp bound. Both
+        # durations are real-time statements about clock skew and late arrival; the
+        # simulated axis is an implementation detail of the simulator, not a unit
+        # anyone reasons in.
+        self.future_tolerance_sim_minutes = (
+            self.settings.future_timestamp_tolerance_real_minutes
+            * compression_ratio()
+        )
 
     # -- pipeline construction ---------------------------------------------
 
@@ -354,7 +412,7 @@ class JobA:
         validated = with_rejection_reason(
             with_sim_now,
             interval_seconds_column=F.lit(self.sim_interval_seconds),
-            future_tolerance_minutes=self.settings.future_timestamp_tolerance_minutes,
+            future_tolerance_minutes=self.future_tolerance_sim_minutes,
         )
         return validated
 
@@ -427,28 +485,14 @@ class JobA:
         """
         payload = valid.select(
             F.col("grid_zone").alias("key"),
-            F.to_json(
-                F.struct(
-                    "event_id",
-                    "meter_id",
-                    "household_id",
-                    "grid_zone",
-                    "power_consumption_kwh",
-                    "solar_generation_kwh",
-                    "net_grid_kwh",
-                    "self_consumption_kwh",
-                    "is_exporting",
-                    "has_solar",
-                    "solar_capacity_kw",
-                    "zone_name",
-                    "zone_capacity_kw",
-                    "time_of_day_bucket",
-                    "event_timestamp",
-                    "sim_date",
-                    "producer_emitted_at",
-                    "correlation_id",
-                )
-            ).alias("value"),
+            # Selected against the ONE definition of this topic's shape in
+            # common/schemas.py, rather than a field list written out here.
+            # Jobs B and C parse the same topic with clean_reading_spark_schema(),
+            # which is built from the same tuple — so a field added to the payload
+            # and not to the consumers' parse is now impossible rather than merely
+            # unlikely. Before Phase 3 this list lived only here, which was safe
+            # only while Job A was the sole job that knew the contract.
+            F.to_json(F.struct(*CLEAN_READING_FIELDS)).alias("value"),
         )
         (
             payload.write.format("kafka")
@@ -580,6 +624,11 @@ class JobA:
             parquet_path=self.settings.parquet_path,
             dedupe_watermark_sim=self.dedupe_watermark,
             dedupe_watermark_real_minutes=self.settings.dedupe_watermark_real_minutes,
+            future_tolerance_real_minutes=(
+                self.settings.future_timestamp_tolerance_real_minutes
+            ),
+            future_tolerance_sim_minutes=round(self.future_tolerance_sim_minutes),
+            compression_ratio=compression_ratio(),
             starting_offsets=self.settings.starting_offsets,
             max_offsets_per_trigger=self.settings.max_offsets_per_trigger,
             sim_interval_seconds=round(self.sim_interval_seconds, 1),

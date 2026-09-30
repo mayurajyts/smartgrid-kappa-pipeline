@@ -152,6 +152,13 @@ services:
       # Scripts here run ONLY when the data directory is empty, i.e. on first
       # boot and after `make clean`. An ordinary restart does not re-run them.
       - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      # The serving DDL, read by 02_serving_schema.sh above. Mounted rather than
+      # inlined into that script so serving/sql/001_schema.sql stays the single
+      # definition of the schema -- `make serving-schema` pipes the same file to a
+      # RUNNING instance, which is the path that matters for anyone whose
+      # postgres-data volume predates Phase 3 (the init hook only fires on an
+      # empty volume).
+      - ./serving/sql:/opt/serving:ro
     healthcheck:
       # Checks the SERVING database specifically, not just the server: the
       # server accepts connections before the init script has finished creating
@@ -474,6 +481,13 @@ services:
       - ${SPARK_DRIVER_MEMORY}
       - --executor-memory
       - ${SPARK_EXECUTOR_MEMORY}
+      # One core per job. WITHOUT THIS a spark-submit claims every free core on
+      # the worker, so whichever job starts first starves the others and they sit
+      # in WAITING forever with no error -- the symptom is a job that logs
+      # "Initial job has not accepted any resources" and never processes a batch,
+      # which reads as a code hang rather than a scheduling problem.
+      - --conf
+      - spark.cores.max=1
       - --conf
       - spark.driver.host=job-a
       - /app/processing/job_a_clean_enrich.py
@@ -493,7 +507,10 @@ services:
       LOG_FORMAT: ${LOG_FORMAT}
       METRICS_PORT: ${METRICS_PORT}
       DEDUPE_WATERMARK_REAL_MINUTES: ${DEDUPE_WATERMARK_REAL_MINUTES}
-      FUTURE_TIMESTAMP_TOLERANCE_MINUTES: ${FUTURE_TIMESTAMP_TOLERANCE_MINUTES}
+      # REAL minutes; the job converts by the compression ratio. Stated in
+      # SIMULATED minutes until Phase 3, which rejected 100% of readings at fast
+      # mode -- see the comment in processing/job_a_clean_enrich.py.
+      FUTURE_TIMESTAMP_TOLERANCE_REAL_MINUTES: ${FUTURE_TIMESTAMP_TOLERANCE_REAL_MINUTES}
       TRIGGER_INTERVAL_SECONDS: ${TRIGGER_INTERVAL_SECONDS}
       CHECKPOINT_ROOT: ${CHECKPOINT_ROOT}
       PARQUET_PATH: ${PARQUET_PATH}
@@ -512,6 +529,169 @@ services:
       # the S3A committer's rename-based commit is unsupported by the object
       # store's gateway - see docs/ADR-004-parquet-sink.md.
       - curated-archive:/data/curated
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Job B -- zone aggregates (R1, R2). Reads job-a's clean topic, writes
+  # zone_load_1m. See the module docstring for why the window is 288 SIMULATED
+  # minutes rather than the 1 minute section 7 says literally.
+  # --------------------------------------------------------------------------
+  job-b:
+    image: smartgrid-spark:latest
+    container_name: smartgrid-job-b
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      # NOT required by job-a, but essential here: the sink is Postgres, so the
+      # serving store must be accepting connections before the first micro-batch
+      # completes. The healthcheck targets the SERVING database specifically, so
+      # this also implies the init scripts have finished creating it.
+      postgres:
+        condition: service_healthy
+      # NOTE: this job consumes job-a's OUTPUT topic. That is deliberately NOT a
+      # depends_on -- job-a is long-lived and never "completes", so compose has no
+      # condition that would express it. With STARTING_OFFSETS=latest this job
+      # simply sees nothing until job-a produces, which is correct behaviour
+      # rather than a race.
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --deploy-mode
+      - client
+      - --driver-memory
+      - ${SPARK_DRIVER_MEMORY}
+      - --executor-memory
+      - ${SPARK_EXECUTOR_MEMORY}
+      # One core per job. WITHOUT THIS a spark-submit claims every free core on
+      # the worker, so whichever job starts first starves the others and they sit
+      # in WAITING forever with no error -- the symptom is a job that logs
+      # "Initial job has not accepted any resources" and never processes a batch,
+      # which reads as a code hang rather than a scheduling problem.
+      - --conf
+      - spark.cores.max=1
+      - --conf
+      - spark.driver.host=job-b
+      - /app/processing/job_b_zone_aggregates.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      TOPIC_METER_READINGS_CLEAN: ${TOPIC_METER_READINGS_CLEAN}
+      # Jobs B and C write to the serving store, which job-a does not -- hence the
+      # POSTGRES_* block and the postgres dependency that job-a has no need of.
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SIM_START_DATE: ${SIM_START_DATE}
+      SIM_ANCHOR_REAL: ${SIM_ANCHOR_REAL}
+      SIM_DAY_REAL_SECONDS: ${SIM_DAY_REAL_SECONDS}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT}
+      METRICS_PORT: ${METRICS_PORT}
+      CHECKPOINT_ROOT: ${CHECKPOINT_ROOT}
+      TRIGGER_INTERVAL_SECONDS: ${TRIGGER_INTERVAL_SECONDS}
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER}
+      STARTING_OFFSETS: ${STARTING_OFFSETS}
+      # Used with the compression ratio to size the batch event-time span that
+      # the startup time-budget assertion checks the watermark against.
+      METER_TICK_REAL_SECONDS: ${METER_TICK_REAL_SECONDS}
+      # Both expressed in REAL minutes and multiplied by the 288x compression
+      # ratio inside the job. A literal reading of section 7's "1 minute" would
+      # be 0.21 real seconds -- see the Job B module docstring.
+      ZONE_WINDOW_REAL_MINUTES: ${ZONE_WINDOW_REAL_MINUTES}
+      ZONE_WATERMARK_REAL_MINUTES: ${ZONE_WATERMARK_REAL_MINUTES}
+    volumes:
+      - spark-checkpoints:/data/checkpoints
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Job C -- household billing (R5, R6). Stream-static join against the
+  # compacted tariff topic; writes household_billing_running. Never writes
+  # household_billing_daily -- that is Airflow's, in Phase 5.
+  # --------------------------------------------------------------------------
+  job-c:
+    image: smartgrid-spark:latest
+    container_name: smartgrid-job-c
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      # NOT required by job-a, but essential here: the sink is Postgres, so the
+      # serving store must be accepting connections before the first micro-batch
+      # completes. The healthcheck targets the SERVING database specifically, so
+      # this also implies the init scripts have finished creating it.
+      postgres:
+        condition: service_healthy
+      # NOTE: this job consumes job-a's OUTPUT topic. That is deliberately NOT a
+      # depends_on -- job-a is long-lived and never "completes", so compose has no
+      # condition that would express it. With STARTING_OFFSETS=latest this job
+      # simply sees nothing until job-a produces, which is correct behaviour
+      # rather than a race.
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --deploy-mode
+      - client
+      - --driver-memory
+      - ${SPARK_DRIVER_MEMORY}
+      - --executor-memory
+      - ${SPARK_EXECUTOR_MEMORY}
+      # One core per job. WITHOUT THIS a spark-submit claims every free core on
+      # the worker, so whichever job starts first starves the others and they sit
+      # in WAITING forever with no error -- the symptom is a job that logs
+      # "Initial job has not accepted any resources" and never processes a batch,
+      # which reads as a code hang rather than a scheduling problem.
+      - --conf
+      - spark.cores.max=1
+      - --conf
+      - spark.driver.host=job-c
+      - /app/processing/job_c_household_billing.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      TOPIC_METER_READINGS_CLEAN: ${TOPIC_METER_READINGS_CLEAN}
+      # The compacted dimension the stream-static join reads each micro-batch.
+      TOPIC_TARIFF_REFERENCE: ${TOPIC_TARIFF_REFERENCE}
+      # Jobs B and C write to the serving store, which job-a does not -- hence the
+      # POSTGRES_* block and the postgres dependency that job-a has no need of.
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SIM_START_DATE: ${SIM_START_DATE}
+      SIM_ANCHOR_REAL: ${SIM_ANCHOR_REAL}
+      SIM_DAY_REAL_SECONDS: ${SIM_DAY_REAL_SECONDS}
+      LOG_LEVEL: ${LOG_LEVEL}
+      LOG_FORMAT: ${LOG_FORMAT}
+      METRICS_PORT: ${METRICS_PORT}
+      CHECKPOINT_ROOT: ${CHECKPOINT_ROOT}
+      TRIGGER_INTERVAL_SECONDS: ${TRIGGER_INTERVAL_SECONDS}
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER}
+      STARTING_OFFSETS: ${STARTING_OFFSETS}
+      # Used with the compression ratio to size the batch event-time span that
+      # the startup time-budget assertion checks the watermark against.
+      METER_TICK_REAL_SECONDS: ${METER_TICK_REAL_SECONDS}
+      BILLING_WATERMARK_REAL_MINUTES: ${BILLING_WATERMARK_REAL_MINUTES}
+      # The block-rate ladder. Must stay consistent with the rates the tariff
+      # simulator publishes; tests/unit/test_billing.py asserts they agree.
+      BILLING_BLOCK_KWH: ${BILLING_BLOCK_KWH}
+      BILLING_TIER_1_RATE: ${BILLING_TIER_1_RATE}
+      BILLING_TIER_2_RATE: ${BILLING_TIER_2_RATE}
+      BILLING_TIER_3_RATE: ${BILLING_TIER_3_RATE}
+      BILLING_TIER_4_RATE: ${BILLING_TIER_4_RATE}
+      BILLING_EXPORT_CREDIT_FRACTION: ${BILLING_EXPORT_CREDIT_FRACTION}
+      BILLING_SUBSIDY_DISCOUNT_PCT: ${BILLING_SUBSIDY_DISCOUNT_PCT}
+    volumes:
+      - spark-checkpoints:/data/checkpoints
     restart: unless-stopped
 
 # -----------------------------------------------------------------------------

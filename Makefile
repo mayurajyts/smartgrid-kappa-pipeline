@@ -27,7 +27,8 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 
 .PHONY: help env anchor up down ps logs topics psql s3 test clock clean \
         consume compaction drop faults dlq trace parquet spark-ui test-spark \
-        dev fast demo-config spark-base rebuild
+        dev fast demo-config spark-base rebuild \
+        serving-schema spark-base-force zones bills bill-replay upsert-restart
 
 help:  ## Show available targets
 	@echo "Smart Grid Kappa Pipeline"
@@ -62,6 +63,12 @@ up: env anchor spark-base  ## Start the stack and create topics/buckets
 	@# checkpoint cannot be inspected while setup is still in flight.
 	@for i in $$(seq 1 60); do 		running=$$($(COMPOSE) ps --status running --services 2>/dev/null 			| grep -E '^(kafka-init|objectstore-init)$$' || true); 		[ -z "$$running" ] && break; 		sleep 2; 	done
 	@echo ""
+	@# Applied on EVERY `make up`, not only on a fresh volume. The init hook in
+	@# docker/postgres/init/ fires only when the data directory is empty, so an
+	@# existing volume would otherwise never gain the Phase 3 tables. Safe to
+	@# repeat because 001_schema.sql is entirely IF NOT EXISTS.
+	@$(MAKE) --no-print-directory serving-schema
+	@echo ""
 	@$(MAKE) --no-print-directory ps
 	@echo ""
 	@echo "Verify the Phase 0 checkpoint with:  make topics"
@@ -92,6 +99,105 @@ topics:  ## PHASE 0 CHECKPOINT: list topics and show compaction settings
 	@echo "          (per-zone ordering for the windowed aggregates)."
 	@echo "=================================================================="
 	@$(COMPOSE) exec kafka kafka-topics --bootstrap-server localhost:9092 --describe
+
+serving-schema:  ## Apply serving/sql/001_schema.sql to a running Postgres (idempotent)
+	@# WHY THIS TARGET EXISTS: the postgres init hook (docker/postgres/init/) runs
+	@# ONLY when the data volume is empty. Anyone whose postgres-data volume
+	@# predates Phase 3 -- which is everyone who ran Phases 0-2 -- would otherwise
+	@# never get these tables, and Job B would die on its first upsert with a bare
+	@# JDBC "relation does not exist" that says nothing about why.
+	@#
+	@# The file is piped in on STDIN rather than read from inside the container, so
+	@# this works with no rebuild and no `make clean`. Every statement in it is
+	@# IF NOT EXISTS, which is what makes running it on every `make up` correct
+	@# rather than merely tolerable.
+	@source .env \
+		&& $(COMPOSE) exec -T postgres \
+		psql -v ON_ERROR_STOP=1 -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB \
+		< serving/sql/001_schema.sql > /dev/null
+	@# The tables are created by the SUPERUSER, so the role the Spark jobs connect
+	@# as owns none of them. Without this grant every upsert fails on permissions,
+	@# which surfaces inside a Spark executor log rather than here.
+	@source .env \
+		&& $(COMPOSE) exec -T postgres \
+		psql -v ON_ERROR_STOP=1 -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c \
+		"GRANT ALL ON ALL TABLES IN SCHEMA public TO $$POSTGRES_USER;\
+		 ALTER DEFAULT PRIVILEGES IN SCHEMA public\
+		 GRANT ALL ON TABLES TO $$POSTGRES_USER;" > /dev/null
+	@echo "Serving schema applied to the smartgrid database (idempotent)."
+
+zones:  ## PHASE 3 CHECKPOINT: Job B zone windows and their size
+	@echo "=================================================================="
+	@echo "ZONE AGGREGATES (zone_load_1m) -- Job B, answering R1 and R2"
+	@echo ""
+	@echo "PASS criteria:"
+	@echo "  * window span is exactly 288 simulated minutes (= 1 REAL minute"
+	@echo "    at 288x). A literal reading of the plan gives 1 sim-minute and"
+	@echo "    ~86,400 rows/real-minute -- see the Job B module docstring."
+	@echo "  * rows grow at ~5 per real minute (one per zone), not thousands"
+	@echo "  * renewable_pct in [0,100], or NULL for a zone with no load"
+	@echo "  * active_meter_count near 40 per zone (200 households / 5 zones)"
+	@echo "=================================================================="
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT grid_zone, window_start, round(total_consumption_kwh,3) AS kwh, round(total_solar_kwh,3) AS solar, round(renewable_pct,1) AS renew_pct, active_meter_count AS meters, late_event_count AS late FROM zone_load_1m ORDER BY window_start DESC, grid_zone LIMIT 15;"
+	@echo "--- window span in simulated minutes (MUST be 288) ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT DISTINCT extract(epoch FROM (window_end-window_start))/60 AS sim_minutes FROM zone_load_1m;"
+	@echo "--- totals ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT count(*) AS rows, count(DISTINCT window_start) AS windows, count(DISTINCT grid_zone) AS zones, min(window_start) AS first_window, max(window_start) AS last_window FROM zone_load_1m;"
+
+bills:  ## PHASE 3 CHECKPOINT: Job C running household bills
+	@echo "=================================================================="
+	@echo "RUNNING BILLS (household_billing_running) -- Job C, R5 and R6"
+	@echo ""
+	@echo "A LIVE ESTIMATE, not an issued bill. household_billing_daily is"
+	@echo "versioned and written by Airflow in Phase 5."
+	@echo ""
+	@echo "PASS criteria:"
+	@echo "  * ~200 rows per sim_date (one per household)"
+	@echo "  * tariff_missing TRUE for the current day (feed arrives at D+1,"
+	@echo "    assumption 14) and FALSE for completed days"
+	@echo "  * running_cost NULL exactly where tariff_missing -- never guessed"
+	@echo "=================================================================="
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT sim_date, count(*) AS households, count(running_cost) AS priced, sum(CASE WHEN tariff_missing THEN 1 ELSE 0 END) AS unpriced, round(sum(consumption_kwh),2) AS total_kwh, round(sum(running_cost),2) AS total_lkr FROM household_billing_running GROUP BY sim_date ORDER BY sim_date DESC;"
+	@echo "--- sample priced bills (the block ladder in action) ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT household_id, sim_date, round(consumption_kwh,3) AS cons, round(solar_kwh,3) AS solar, round(net_grid_kwh,3) AS net, round(self_consumption_ratio,3) AS self_ratio, running_cost, tariff_missing FROM household_billing_running WHERE running_cost IS NOT NULL ORDER BY running_cost DESC LIMIT 8;"
+	@echo "--- INVARIANT: running_cost IS NULL iff tariff_missing (MUST be 0) ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT count(*) AS contradictions FROM household_billing_running WHERE (running_cost IS NULL) <> tariff_missing;"
+
+upsert-restart:  ## PHASE 3 CHECKPOINT: upserts idempotent under forced restart
+	@echo "=================================================================="
+	@echo "IDEMPOTENCE UNDER FORCED RESTART"
+	@echo ""
+	@echo "SIGKILL, not a graceful stop: a graceful stop lets the query finish"
+	@echo "its batch and commit, which tests nothing. The point is a crash"
+	@echo "between the staging write and the checkpoint commit."
+	@echo "=================================================================="
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "DROP TABLE IF EXISTS zone_replay_baseline; CREATE TABLE zone_replay_baseline AS SELECT * FROM zone_load_1m;"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT count(*) AS baseline_rows FROM zone_replay_baseline;"
+	@echo "Killing job-b (SIGKILL)..."
+	@docker kill --signal=KILL smartgrid-job-b >/dev/null 2>&1 || true
+	@$(COMPOSE) up -d job-b >/dev/null 2>&1
+	@echo "Restarted. Waiting 90s for the uncommitted batch to replay..."
+	@sleep 90
+	@echo "--- rows CHANGED in a SETTLED window (MUST be 0) ---"
+	@echo "    Windows inside the watermark may legitimately change: update"
+	@echo "    mode re-emits them as late data arrives, so only windows older"
+	@echo "    than one watermark (576 sim-min) are compared."
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT count(*) AS differing_rows FROM zone_replay_baseline b JOIN zone_load_1m z USING (grid_zone, window_start) WHERE z.window_end < (SELECT max(window_end) FROM zone_load_1m) - interval '576 minutes' AND (b.total_consumption_kwh IS DISTINCT FROM z.total_consumption_kwh OR b.total_solar_kwh IS DISTINCT FROM z.total_solar_kwh OR b.active_meter_count IS DISTINCT FROM z.active_meter_count);"
+	@echo "--- duplicate primary keys (MUST be 0) ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT count(*) AS duplicate_keys FROM (SELECT grid_zone, window_start FROM zone_load_1m GROUP BY 1,2 HAVING count(*) > 1) d;"
+	@echo "--- staging tables hold one batch, never grow ---"
+	@source .env && $(COMPOSE) exec -T postgres \
+		psql -q -P pager=off -U $$POSTGRES_SUPERUSER -d $$POSTGRES_DB -c "SELECT relname, n_live_tup FROM pg_stat_user_tables WHERE relname LIKE 'stg_%%' ORDER BY relname;"
 
 psql:  ## Open a psql shell on the serving database
 	@source .env && $(COMPOSE) exec postgres \
@@ -330,10 +436,27 @@ spark-base:  ## Build the Spark base image (deps + JARs; slow, run once)
 
 # Rebuild ONLY the thin application layer. ~5 seconds, versus ~6 minutes before the
 # base image was split out.
+spark-base-force:  ## Force-rebuild the Spark base image (after a JAR or dep change)
+	@# `make spark-base` deliberately SKIPS the build when the image already exists,
+	@# which is what keeps the inner loop at ~5 seconds. That gate also means a new
+	@# JAR or pip dependency in docker/spark/Dockerfile.base is silently ignored --
+	@# the stale image is served instead, and the symptom is a runtime error that
+	@# looks like application code (e.g. "No suitable driver found").
+	@#
+	@# This target removes the image so the build actually runs. ~6 real minutes,
+	@# and needed only when Dockerfile.base itself changes.
+	docker image rm -f smartgrid-spark-base:latest >/dev/null 2>&1 || true
+	@$(MAKE) --no-print-directory spark-base
+	@docker build -q -f docker/spark/Dockerfile -t smartgrid-spark:latest . >/dev/null
+	@echo "Base and app images rebuilt."
+
 rebuild: spark-base  ## Rebuild the Spark app image after a code change (~5s)
 	@docker build -q -f docker/spark/Dockerfile -t smartgrid-spark:latest . >/dev/null
-	@$(COMPOSE) up -d job-a
-	@echo "Rebuilt and restarted job-a."
+	@# All three streaming jobs share one image, so a code change to any of them
+	@# needs all three restarted -- restarting only job-a would leave B and C
+	@# running the previous build, which reads as a change that had no effect.
+	@$(COMPOSE) up -d job-a job-b job-c
+	@echo "Rebuilt and restarted job-a, job-b, job-c."
 
 # Start the stack with the source tree bind-mounted, so a code edit needs only a
 # container restart and no rebuild at all. See docker-compose.dev.yml for the

@@ -137,7 +137,7 @@ def solar_exceeds_physical_capacity(interval_seconds_column: Column) -> Column:
     return F.col("solar_generation_kwh") > (max_possible + F.lit(1e-6))
 
 
-def timestamp_too_far_in_future(tolerance_minutes: int) -> Column:
+def timestamp_too_far_in_future(tolerance_minutes: float) -> Column:
     """True when `event_timestamp` is implausibly ahead of the current simulated time.
 
     A future timestamp is not merely odd — it is actively damaging to a streaming
@@ -154,15 +154,21 @@ def timestamp_too_far_in_future(tolerance_minutes: int) -> Column:
     The threshold is passed in (not read from config here) so this stays a pure
     function of its arguments and is directly testable.
     """
+    # Seconds rather than minutes, and a float rather than an int: the caller
+    # converts a REAL-minute tolerance onto the simulated axis by multiplying by the
+    # compression ratio (see job_a_clean_enrich.py), which rarely yields a whole
+    # number of minutes. `INTERVAL 288.0 MINUTES` is a SQL parse error, so the value
+    # is carried as seconds and rounded once, here.
+    tolerance_seconds = int(round(tolerance_minutes * 60))
     return F.col("event_timestamp") > (
-        F.col("sim_now") + F.expr(f"INTERVAL {tolerance_minutes} MINUTES")
+        F.col("sim_now") + F.expr(f"INTERVAL {tolerance_seconds} SECONDS")
     )
 
 
 def with_rejection_reason(
     frame: DataFrame,
     interval_seconds_column: Column,
-    future_tolerance_minutes: int,
+    future_tolerance_minutes: float,
 ) -> DataFrame:
     """Add a `rejection_reason` column: the single reason, or null when valid.
 
@@ -172,7 +178,9 @@ def with_rejection_reason(
             the current simulated instant.
         interval_seconds_column: simulated seconds each reading covers, used for the
             physical solar bound.
-        future_tolerance_minutes: how far ahead of simulated now a timestamp may be.
+        future_tolerance_minutes: how far ahead of simulated now a timestamp may
+            be, IN SIMULATED MINUTES. The caller is responsible for converting a
+            real-time tolerance onto this axis; see job_a_clean_enrich.py.
 
     Returns:
         The frame with `rejection_reason` added. Callers split on
